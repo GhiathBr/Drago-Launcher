@@ -1,7 +1,5 @@
 # 🐉 Drago Launcher
 
-![Drago Launcher Logo/Banner](https://via.placeholder.com/800x200.png?text=Drago+Launcher)
-
 A highly customized, safe, and feature-rich Minecraft Launcher built with Python and CustomTkinter. Drago Launcher is designed to provide a clean, modern user interface while packing powerful Quality of Life (QoL) features like built-in mod management, world management, and custom skin support.
 
 ## ✨ Key Features
