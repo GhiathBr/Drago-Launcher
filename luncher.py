@@ -5,7 +5,21 @@ import os
 import sys
 import threading
 import json
+import requests
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
 from instance_manager import InstanceManager
+
+# Suppress insecure request warnings and globally disable SSL verification
+# This bypasses strict antivirus/firewall deep packet inspection (e.g. Avast) that breaks downloads
+warnings.simplefilter('ignore', InsecureRequestWarning)
+original_request = requests.Session.request
+
+def patched_request(self, method, url, **kwargs):
+    kwargs['verify'] = False
+    return original_request(self, method, url, **kwargs)
+
+requests.Session.request = patched_request
 
 # --- APP SETUP ---
 ctk.set_appearance_mode("dark")
@@ -723,7 +737,7 @@ class DragoLauncher(ctk.CTk):
         except Exception:
             pass
 
-    def search_modrinth(self, init_query=None):
+    def search_modrinth(self, init_query=None, offset=0):
         # Clear old results safely via the main thread context
         def clear_widgets():
             for widget in self.mod_results_frame.winfo_children():
@@ -781,7 +795,7 @@ class DragoLauncher(ctk.CTk):
         is_vanilla = not any(loader in raw_version.lower() for loader in ['fabric', 'forge', 'quilt', 'neoforge'])
         
         # Update version label and warning
-        self.after(0, lambda: self.mod_version_label.configure(text=f"Browsing mods for: Minecraft {target_version}"))
+        self.after(0, lambda: self.mod_version_label.configure(text=f"Browsing mods for: Minecraft {target_version} (Page {offset//15 + 1})"))
         
         if is_vanilla:
             self.after(0, lambda: self.mod_loader_warning.configure(
@@ -800,7 +814,7 @@ class DragoLauncher(ctk.CTk):
             # Setup specific query to Modrinth - Filter by Fabric and selected Version
             facets = f'[["versions:{target_version}"],["categories:fabric"]]'
             encoded_facets = urllib.parse.quote(facets)
-            url = f"https://api.modrinth.com/v2/search?limit=15&facets={encoded_facets}"
+            url = f"https://api.modrinth.com/v2/search?limit=15&offset={offset}&facets={encoded_facets}"
             if query:
                 url += f"&query={urllib.parse.quote(query)}"
             else:
@@ -812,6 +826,7 @@ class DragoLauncher(ctk.CTk):
             self.after(0, clear_widgets)
                 
             hits = resp.get("hits", [])
+            total_hits = resp.get("total_hits", 0)
             if not hits:
                 show_status(f"No Fabric mods found for Minecraft {target_version}.")
                 return
@@ -829,13 +844,13 @@ class DragoLauncher(ctk.CTk):
                         pass
                 
             # Safely render results onto UI
-            self.after(0, self.render_mod_results, hits, target_version)
+            self.after(0, self.render_mod_results, hits, target_version, offset, total_hits, query)
                 
         except Exception as e:
             self.after(0, clear_widgets)
             show_status(f"Error connecting to Modrinth:\n{e}")
 
-    def render_mod_results(self, hits, target_version):
+    def render_mod_results(self, hits, target_version, offset, total_hits, query):
         for i, mod in enumerate(hits):
             card = ctk.CTkFrame(self.mod_results_frame, fg_color="#2b2b2b", corner_radius=5)
             card.grid(row=i, column=0, sticky="ew", pady=5, padx=5)
@@ -859,6 +874,20 @@ class DragoLauncher(ctk.CTk):
             btn = ctk.CTkButton(card, text="Install\nMod", width=70, fg_color="#1f538d", hover_color="#2980b9",
                                 command=lambda m_id=mod["project_id"], m_title=mod["title"]: threading.Thread(target=self.install_modrinth_mod, args=(m_id, target_version, m_title)).start())
             btn.grid(row=0, column=3, rowspan=2, padx=10, pady=10)
+
+        # Build Pagination Framework
+        pagination_frame = ctk.CTkFrame(self.mod_results_frame, fg_color="transparent")
+        pagination_frame.grid(row=len(hits), column=0, pady=15)
+        
+        if offset > 0:
+            prev_btn = ctk.CTkButton(pagination_frame, text="< Previous", width=100,
+                                     command=lambda: threading.Thread(target=self.search_modrinth, args=(query, max(0, offset - 15))).start())
+            prev_btn.pack(side="left", padx=10)
+            
+        if offset + 15 < total_hits:
+            next_btn = ctk.CTkButton(pagination_frame, text="Next >", width=100,
+                                     command=lambda: threading.Thread(target=self.search_modrinth, args=(query, offset + 15)).start())
+            next_btn.pack(side="left", padx=10)
 
     def show_mod_details(self, mod, target_version):
         self.mod_version_label.grid_forget()
@@ -1134,15 +1163,151 @@ class DragoLauncher(ctk.CTk):
             for iv in self.installed_versions_cache:
                 friendly_name = get_friendly_name(iv)
                 self.version_id_to_display[friendly_name] = iv
+                # Ensure no duplicates
                 if friendly_name not in dropdown_values:
                     dropdown_values.append(friendly_name)
-            
+
             self.dropdown_values = dropdown_values
+            # Append OptiFine
+            self.fetch_optifine_versions()
             
             self._update_ui_status("✓ Version list updated - Fabric is now available!", "#27ae60")
             
         except Exception as e:
             print(f"Error refreshing versions: {e}")
+
+    def fetch_optifine_versions(self):
+        """
+        Scrapes OptiFine versions directly from optifine.net and inserts them directly
+        above their vanilla equivalent.
+        """
+        try:
+            import requests
+            import re
+            
+            # Scrape direct from Optifine
+            response = requests.get("https://optifine.net/downloads", verify=False, timeout=10)
+            html = response.text
+            
+            # Find Optifine jar identifiers (e.g. OptiFine_1.21.11_HD_U_J9.jar)
+            matches = re.findall(r'OptiFine_(\d+\.\d+(\.\d+)?)_([A-Z0-9_]+)\.jar', html)
+            
+            optifine_manifest = {}
+            for mc_ver, _, build_id in matches:
+                optifine_id = f"{mc_ver}-OptiFine_{build_id}"
+                # If we haven't mapped this MC version yet, map it (gets the latest build in the list)
+                if optifine_id not in optifine_manifest.values():
+                    # Link to download page mirror
+                    jar_filename = f"OptiFine_{mc_ver}_{build_id}.jar"
+                    optifine_manifest[optifine_id] = f"https://optifine.net/downloadx?f={jar_filename}&x=1"
+            
+            self.optifine_manifest = optifine_manifest
+            
+            # Group them in the UI directly above their vanilla versions
+            new_dropdown = []
+            
+            # Use current dropdown_values to insert OptiFine versions in the logical order
+            for display_name in self.dropdown_values:
+                actual_id = self.version_id_to_display.get(display_name, display_name)
+                
+                # If it's a vanilla release, check if we scraped an OptiFine version for it
+                opti_tag = None
+                for opti_id in optifine_manifest.keys():
+                    if opti_id.startswith(f"{actual_id}-OptiFine"):
+                        opti_tag = opti_id
+                        break
+                        
+                if opti_tag and opti_tag not in new_dropdown:
+                    new_dropdown.append(opti_tag)
+                    self.version_id_to_display[opti_tag] = opti_tag
+
+                # Add vanilla version beneath it
+                if display_name not in new_dropdown:
+                    new_dropdown.append(display_name)
+                    
+            self.dropdown_values = new_dropdown
+                    
+        except Exception as e:
+            print(f"Failed to scrape OptiFine versions: {e}")
+
+    def check_and_download_optifine(self, version_name, mine_dir):
+        version_dir = os.path.join(mine_dir, "versions", version_name)
+        
+        if "OptiFine" in version_name and not os.path.exists(version_dir):
+            if not hasattr(self, 'optifine_manifest'):
+                self.fetch_optifine_versions()
+
+            download_url = self.optifine_manifest.get(version_name)
+            if not download_url:
+                raise Exception("OptiFine download URL not found in manifest!")
+                
+            jar_path = os.path.join(mine_dir, f"{version_name}_Installer.jar")
+            
+            # --- UI Feedback (Progress Bar) ---
+            self._update_ui_status(f"Downloading {version_name}...", "#3498db")
+            self.progress_bar.pack(pady=10)
+            self.progress_bar.set(0)
+            
+            import requests # Must be available globally or imported here
+            # Download the JAR with progress
+            response = requests.get(download_url, stream=True)
+            total_size = int(response.headers.get('content-length', 0))
+            block_size = 1024
+            downloaded = 0
+            
+            with open(jar_path, 'wb') as file:
+                for data in response.iter_content(block_size):
+                    file.write(data)
+                    downloaded += len(data)
+                    if total_size > 0:
+                        progress = float(downloaded) / float(total_size)
+                        self.progress_bar.set(progress)
+                        # Update Tkinter window
+                        self.update_idletasks()
+                        
+            self._update_ui_status("Extracting OptiFine (Headless)...", "#f39c12")
+            self.install_optifine_headless(jar_path, mine_dir, version_name)
+
+    def install_optifine_headless(self, installer_jar_path, mine_dir, target_version_name):
+        """
+        Runs the OptiFine JAR invisibly, extracts the custom libraries, 
+        and generates the [version].json metadata file.
+        """
+        import minecraft_launcher_lib
+        import subprocess
+        
+        java_path = minecraft_launcher_lib.utils.get_java_executable()
+        if not java_path:
+            java_path = "java" # Fallback to system env
+            
+        try:
+            # Run Optifine Installer dynamically in the background without GUI
+            # Syntax: java -jar OptiFine.jar install <Target .minecraft Directory> 
+            
+            install_command = [
+                java_path,
+                "-jar",
+                installer_jar_path,
+                "install", 
+                mine_dir
+            ]
+            
+            subprocess.run(
+                install_command, 
+                check=True, 
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                cwd=mine_dir
+            )
+            
+            # Cleanup the installer JAR after it generates the folder
+            if os.path.exists(installer_jar_path):
+                os.remove(installer_jar_path)
+                
+            self._update_ui_status(f"OptiFine installed successfully!", "#27ae60")
+            
+        except subprocess.CalledProcessError as e:
+            self._update_ui_status("OptiFine extraction failed!", "#e74c3c")
+            print(f"Extraction Error: {e}")
 
     def open_settings(self):
         settings_window = ctk.CTkToplevel(self)
@@ -1360,6 +1525,10 @@ class DragoLauncher(ctk.CTk):
                 dropdown_values.append(v)
                 self.version_id_to_display[v] = v
         
+        self.dropdown_values = dropdown_values
+        self.fetch_optifine_versions()
+        dropdown_values = self.dropdown_values
+        
         print(f"DEBUG: Total dropdown values: {len(dropdown_values)}")
         print(f"DEBUG: First 10 values: {dropdown_values[:10]}")
                 
@@ -1432,18 +1601,37 @@ class DragoLauncher(ctk.CTk):
         """Update play button text"""
         self.play_button.configure(text="▶ PLAY")
 
+    def set_gpu_preference(self, java_path):
+        try:
+            import winreg
+            key_path = r"Software\Microsoft\DirectX\UserGpuPreferences"
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+            except FileNotFoundError:
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
+            
+            winreg.SetValueEx(key, java_path, 0, winreg.REG_SZ, "GpuPreference=2;")
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Failed to set GPU preference: {e}")
+
     def get_rtx3050_jvm_args(self):
         ram = int(self.config.get("memory", 6))
 
         args = [
             f"-Xmx{ram}G",
             f"-Xms{ram}G",
-            "-XX:+UnlockExperimentalVMOptions",
             "-XX:+UseG1GC",
-            "-XX:G1NewSizePercent=20",
+            "-XX:+ParallelRefProcEnabled",
+            "-XX:MaxGCPauseMillis=200",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+DisableExplicitGC",
+            "-XX:+AlwaysPreTouch",
+            "-XX:G1NewSizePercent=30",
+            "-XX:G1MaxNewSizePercent=40",
+            "-XX:G1HeapRegionSize=8M",
             "-XX:G1ReservePercent=20",
-            "-XX:MaxGCPauseMillis=50",
-            "-XX:G1HeapRegionSize=32M",
+            "-XX:G1HeapWastePercent=5",
             "-Dcustomskinloader.enabled=true"
         ]
 
@@ -1565,9 +1753,13 @@ class DragoLauncher(ctk.CTk):
                 json.dump(self.config, f)
 
         try:
-            # Install version if missing
+            # Check for Optifine installation
+            if "OptiFine" in version:
+                self.check_and_download_optifine(version, mine_dir)
+
+            # Install absolute vanilla version if missing
             version_path = os.path.join(mine_dir, "versions", version)
-            if not os.path.exists(version_path):
+            if not os.path.exists(version_path) and "OptiFine" not in version:
                 self._update_ui_status(f"Downloading {version}...", "#3498db")
                 self.progress_bar.pack(pady=10)
 
@@ -1598,18 +1790,24 @@ class DragoLauncher(ctk.CTk):
             else:
                 settings = instance['settings']
                 ram_max = settings.get('ram_max', 4)
-                ram_min = settings.get('ram_min', 2)
+                # Match Xms to Xmx per requirement
+                ram_min = ram_max
             
             # Build JVM arguments
             jvm_args = [
                 f"-Xmx{ram_max}G",
                 f"-Xms{ram_min}G",
-                "-XX:+UnlockExperimentalVMOptions",
                 "-XX:+UseG1GC",
-                "-XX:G1NewSizePercent=20",
+                "-XX:+ParallelRefProcEnabled",
+                "-XX:MaxGCPauseMillis=200",
+                "-XX:+UnlockExperimentalVMOptions",
+                "-XX:+DisableExplicitGC",
+                "-XX:+AlwaysPreTouch",
+                "-XX:G1NewSizePercent=30",
+                "-XX:G1MaxNewSizePercent=40",
+                "-XX:G1HeapRegionSize=8M",
                 "-XX:G1ReservePercent=20",
-                "-XX:MaxGCPauseMillis=50",
-                "-XX:G1HeapRegionSize=32M",
+                "-XX:G1HeapWastePercent=5",
                 "-Dcustomskinloader.enabled=true"
             ]
             
@@ -1699,6 +1897,8 @@ class DragoLauncher(ctk.CTk):
             
             if java_path:
                 command[0] = java_path
+                # Automate GPU Preference to High Performance (2)
+                self.set_gpu_preference(java_path)
 
             # Debug final command
             print("FINAL COMMAND:")
@@ -1711,6 +1911,19 @@ class DragoLauncher(ctk.CTk):
             self.play_button.configure(state="normal")
 
             process = subprocess.Popen(command)
+            
+            # Process Affinity (cores 0-3 bitmask 0x0F) and Priority (High = 0x00000080)
+            try:
+                import ctypes
+                PROCESS_ALL_ACCESS = 0x1F0FFF
+                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, process.pid)
+                if handle:
+                    ctypes.windll.kernel32.SetPriorityClass(handle, 0x00000080)
+                    ctypes.windll.kernel32.SetProcessAffinityMask(handle, 0x0F)
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    print(f"Successfully applied Priority High and CPU Affinity 0x0F to PID {process.pid}")
+            except Exception as priority_err:
+                print(f"Failed to set CPU properties: {priority_err}")
             
             # Update play stats if using instance system
             if not use_global:
