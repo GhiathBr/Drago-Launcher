@@ -834,14 +834,20 @@ class DragoLauncher(ctk.CTk):
             # Prefetch icons in background thread to avoid freezing UI
             from PIL import Image
             import io
-            for mod in hits:
-                mod['pil_image'] = None
-                if mod.get('icon_url'):
+            import concurrent.futures
+            
+            def fetch_icon(mod_item):
+                mod_item['pil_image'] = None
+                if mod_item.get('icon_url'):
                     try:
-                        img_data = requests.get(mod['icon_url'], timeout=3).content
-                        mod['pil_image'] = Image.open(io.BytesIO(img_data)).resize((50, 50), Image.LANCZOS)
+                        img_data = requests.get(mod_item['icon_url'], timeout=3).content
+                        mod_item['pil_image'] = Image.open(io.BytesIO(img_data)).resize((50, 50), Image.LANCZOS)
                     except Exception:
                         pass
+                return mod_item
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                list(executor.map(fetch_icon, hits))
                 
             # Safely render results onto UI
             self.after(0, self.render_mod_results, hits, target_version, offset, total_hits, query)
@@ -871,8 +877,8 @@ class DragoLauncher(ctk.CTk):
                                      command=lambda m=mod: self.show_mod_details(m, target_version))
             view_btn.grid(row=0, column=2, rowspan=2, padx=5, pady=10)
             
-            btn = ctk.CTkButton(card, text="Install\nMod", width=70, fg_color="#1f538d", hover_color="#2980b9",
-                                command=lambda m_id=mod["project_id"], m_title=mod["title"]: threading.Thread(target=self.install_modrinth_mod, args=(m_id, target_version, m_title)).start())
+            btn = ctk.CTkButton(card, text="Install\nMod", width=70, fg_color="#1f538d", hover_color="#2980b9")
+            btn.configure(command=lambda m_id=mod["project_id"], m_title=mod["title"], b=btn: threading.Thread(target=self.install_modrinth_mod, args=(m_id, target_version, m_title, b)).start())
             btn.grid(row=0, column=3, rowspan=2, padx=10, pady=10)
 
         # Build Pagination Framework
@@ -921,43 +927,101 @@ class DragoLauncher(ctk.CTk):
         ctk.CTkLabel(header_frame, text=mod["title"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=1, sticky="w")
         ctk.CTkLabel(header_frame, text=f"Author: {mod.get('author', 'Unknown')}", text_color="#aaaaaa").grid(row=1, column=1, sticky="nw")
         
-        install_btn = ctk.CTkButton(header_frame, text="Install Mod", fg_color="#27ae60", hover_color="#2ecc71", font=ctk.CTkFont(weight="bold"),
-                                    command=lambda: threading.Thread(target=self.install_modrinth_mod, args=(mod["project_id"], target_version, mod["title"])).start())
+        install_btn = ctk.CTkButton(header_frame, text="Install Mod", fg_color="#27ae60", hover_color="#2ecc71", font=ctk.CTkFont(weight="bold"))
+        install_btn.configure(command=lambda b=install_btn: threading.Thread(target=self.install_modrinth_mod, args=(mod["project_id"], target_version, mod["title"], b)).start())
         install_btn.grid(row=0, column=2, rowspan=2, padx=20, sticky="e")
         header_frame.grid_columnconfigure(1, weight=1)
         
         desc_frame = ctk.CTkFrame(self.mod_detail_frame, fg_color="#2b2b2b")
         desc_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        self.mod_detail_frame.grid_rowconfigure(2, weight=1)
+        self.mod_detail_frame.grid_columnconfigure(0, weight=1)
         
-        desc_label = ctk.CTkLabel(desc_frame, text=mod["description"] + "\n\nFetching complete description...", wraplength=650, justify="left", font=ctk.CTkFont(size=14))
-        desc_label.pack(padx=20, pady=20, anchor="w", fill="x", expand=True)
+        desc_textbox = ctk.CTkTextbox(desc_frame, wrap="word", font=ctk.CTkFont(size=14))
+        desc_textbox.pack(padx=20, pady=20, fill="both", expand=True)
+        desc_textbox.insert("0.0", mod["description"] + "\n\nFetching complete description...")
+        desc_textbox.configure(state="disabled")
 
         def fetch_full_info():
             import requests
             import re
+            from PIL import Image, ImageTk
+            import io
             try:
                 # Query the specific project endpoint to get the giant "body" description
                 resp = requests.get(f"https://api.modrinth.com/v2/project/{mod['project_id']}", headers={"User-Agent": "DragoLauncher/1.0"}, timeout=5).json()
                 body = resp.get("body", "")
                 if body:
+                    # Extract image URLs to render them natively (limit to 10 to protect memory)
+                    img_urls = [url for _, url in re.findall(r'!\[(.*?)\]\(([^)]+)\)', body)][:10]
+                    
                     # Clean up html and basic markdown headers so it reads cleaner in a UI label
                     body = re.sub(r'<[^>]+>', '', body)
                     body = re.sub(r'#+\s+', '', body)
+                    # Strip markdown images entirely from text flow
+                    body = re.sub(r'!\[.*?\]\([^)]+\)', '', body)
+                    # Convert markdown links to just their text
+                    body = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', body)
                     
                     # Limit the string size so Tkinter doesn't freeze on gigantic mod pages
                     if len(body) > 12000:
                         body = body[:12000] + "...\n\n[Description Truncated due to length - Install to play!]"
                     
-                    self.after(0, lambda: desc_label.configure(text=body))
+                    def update_ui(text=body):
+                        desc_textbox.configure(state="normal")
+                        desc_textbox.delete("0.0", "end")
+                        desc_textbox.insert("0.0", text)
+                        desc_textbox.configure(state="disabled")
+
+                    self.after(0, update_ui)
+                    
+                    # Async load and render the images at the bottom of the textbox
+                    if img_urls:
+                        desc_textbox.image_references = getattr(desc_textbox, 'image_references', [])
+                        
+                        def inject_images():
+                            for url in img_urls:
+                                try:
+                                    # Ignore svg shields and badges which often break or don't render well
+                                    if ".svg" in url.lower() or "shields.io" in url.lower():
+                                        continue
+                                        
+                                    img_data = requests.get(url, timeout=5).content
+                                    pil_img = Image.open(io.BytesIO(img_data))
+                                    
+                                    # Scale down if too large for launcher panel
+                                    max_w = 600
+                                    if pil_img.width > max_w:
+                                        ratio = max_w / float(pil_img.width)
+                                        new_h = int((float(pil_img.height) * float(ratio)))
+                                        pil_img = pil_img.resize((max_w, new_h), Image.LANCZOS)
+                                        
+                                    photo_img = ImageTk.PhotoImage(pil_img)
+                                    
+                                    def append_to_tb(img=photo_img):
+                                        desc_textbox.image_references.append(img)
+                                        desc_textbox.configure(state="normal")
+                                        desc_textbox.insert("end", "\n\n")
+                                        desc_textbox._textbox.image_create("end", image=img)
+                                        desc_textbox.configure(state="disabled")
+                                        
+                                    self.after(0, append_to_tb)
+                                except Exception as e:
+                                    print(f"Failed to load markdown image {url}: {e}")
+                                    
+                        threading.Thread(target=inject_images, daemon=True).start()
             except Exception:
                 pass
                 
         threading.Thread(target=fetch_full_info, daemon=True).start()
 
-    def install_modrinth_mod(self, project_id, target_version, project_title):
+    def install_modrinth_mod(self, project_id, target_version, project_title, btn=None):
         import requests
         import shutil
         from pathlib import Path
+
+        if btn:
+            self.after(0, lambda: btn.configure(text="Installing", state="disabled", fg_color="#f39c12"))
         
         # Check if current version supports mods
         display_version = self.version_var.get()
@@ -1125,8 +1189,14 @@ class DragoLauncher(ctk.CTk):
                     shutil.copyfileobj(r.raw, f)
             
             self._update_ui_status(f"✓ Installed {project_title} for MC {target_version}!", "#27ae60")
+            
+            if btn:
+                self.after(0, lambda: btn.configure(text="Installed", fg_color="#27ae60"))
+                
         except Exception as e:
             self._update_ui_status(f"Failed to install mod", "#e74c3c")
+            if btn:
+                self.after(0, lambda: btn.configure(text="Install\nFailed", fg_color="#e74c3c", state="normal"))
             print(f"Mod Install Error: {e}")
     
     def _refresh_version_dropdown(self):
@@ -1621,17 +1691,12 @@ class DragoLauncher(ctk.CTk):
         args = [
             f"-Xmx{ram}G",
             f"-Xms{ram}G",
-            "-XX:+UseG1GC",
-            "-XX:+ParallelRefProcEnabled",
-            "-XX:MaxGCPauseMillis=200",
             "-XX:+UnlockExperimentalVMOptions",
-            "-XX:+DisableExplicitGC",
-            "-XX:+AlwaysPreTouch",
-            "-XX:G1NewSizePercent=30",
-            "-XX:G1MaxNewSizePercent=40",
-            "-XX:G1HeapRegionSize=8M",
+            "-XX:+UseG1GC",
+            "-XX:G1NewSizePercent=20",
             "-XX:G1ReservePercent=20",
-            "-XX:G1HeapWastePercent=5",
+            "-XX:MaxGCPauseMillis=50",
+            "-XX:G1HeapRegionSize=32M",
             "-Dcustomskinloader.enabled=true"
         ]
 
@@ -1797,17 +1862,12 @@ class DragoLauncher(ctk.CTk):
             jvm_args = [
                 f"-Xmx{ram_max}G",
                 f"-Xms{ram_min}G",
-                "-XX:+UseG1GC",
-                "-XX:+ParallelRefProcEnabled",
-                "-XX:MaxGCPauseMillis=200",
                 "-XX:+UnlockExperimentalVMOptions",
-                "-XX:+DisableExplicitGC",
-                "-XX:+AlwaysPreTouch",
-                "-XX:G1NewSizePercent=30",
-                "-XX:G1MaxNewSizePercent=40",
-                "-XX:G1HeapRegionSize=8M",
+                "-XX:+UseG1GC",
+                "-XX:G1NewSizePercent=20",
                 "-XX:G1ReservePercent=20",
-                "-XX:G1HeapWastePercent=5",
+                "-XX:MaxGCPauseMillis=50",
+                "-XX:G1HeapRegionSize=32M",
                 "-Dcustomskinloader.enabled=true"
             ]
             
@@ -1912,16 +1972,17 @@ class DragoLauncher(ctk.CTk):
 
             process = subprocess.Popen(command)
             
-            # Process Affinity (cores 0-3 bitmask 0x0F) and Priority (High = 0x00000080)
+            # Process Priority (High = 0x00000080)
+            # CAUTION: We REMOVED the CPU Affinity mask (0x0F) because forcing Minecraft 
+            # to only use 4 cores severely chokes chunk rendering and world generation.
             try:
                 import ctypes
                 PROCESS_ALL_ACCESS = 0x1F0FFF
                 handle = ctypes.windll.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, process.pid)
                 if handle:
                     ctypes.windll.kernel32.SetPriorityClass(handle, 0x00000080)
-                    ctypes.windll.kernel32.SetProcessAffinityMask(handle, 0x0F)
                     ctypes.windll.kernel32.CloseHandle(handle)
-                    print(f"Successfully applied Priority High and CPU Affinity 0x0F to PID {process.pid}")
+                    print(f"Successfully applied Priority High to PID {process.pid}")
             except Exception as priority_err:
                 print(f"Failed to set CPU properties: {priority_err}")
             
@@ -1930,6 +1991,9 @@ class DragoLauncher(ctk.CTk):
                 self.instance_manager.update_play_stats(current_instance_id, 0)
             
             self._update_ui_status("Game Running!", "#27ae60")
+            
+            process.wait()
+            self._update_ui_status("Ready to play", "#aaaaaa")
 
         except Exception as e:
             self._update_ui_status("Launch Error!", "#e74c3c")
