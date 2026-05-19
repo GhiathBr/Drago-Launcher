@@ -33,8 +33,21 @@ class DragoLauncher(ctk.CTk):
         self.geometry("900x600")
         self.minsize(800, 500)
         
-        # Load Config globally
-        self.config_file = "drago_launcher_config.json"
+        self.CURRENT_VERSION = "v1.2"
+        
+        # Load Config from AppData/.minecraft globally (hiding it)
+        mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+        if not os.path.exists(mine_dir):
+            os.makedirs(mine_dir, exist_ok=True)
+            
+        self.config_file = os.path.join(mine_dir, "drago_launcher_config.json")
+        
+        # Keep backward compatibility by moving an old config if it exists alongside the app
+        old_config_file = "drago_launcher_config.json"
+        if os.path.exists(old_config_file) and not os.path.exists(self.config_file):
+            import shutil
+            shutil.move(old_config_file, self.config_file)
+            
         self.config = {"last_version": "", "memory": 6, "current_instance": None, "use_global_minecraft": True}
         if os.path.exists(self.config_file):
             try:
@@ -90,6 +103,9 @@ class DragoLauncher(ctk.CTk):
         
         # Show News by default
         self.show_news_page()
+        
+        # Auto-check for updates silently on startup
+        self.after(2000, lambda: self.check_for_updates(silent=True))
 
     def show_news_page(self):
         self.content_browser_frame.grid_forget()
@@ -128,6 +144,9 @@ class DragoLauncher(ctk.CTk):
 
         self.btn_mods = ctk.CTkButton(self.sidebar_frame, text="Game Content Browser", fg_color="#1f538d", anchor="w", command=self.show_content_page)
         self.btn_mods.grid(row=4, column=0, padx=20, pady=10)
+
+        self.btn_update = ctk.CTkButton(self.sidebar_frame, text="Check for Updates", fg_color="#2ecc71", anchor="w", command=self.check_for_updates)
+        self.btn_update.grid(row=5, column=0, padx=20, pady=10)
 
         self.btn_settings = ctk.CTkButton(self.sidebar_frame, text="Settings", fg_color="#1f538d", anchor="w", command=self.open_settings)
         self.btn_settings.grid(row=6, column=0, padx=20, pady=20)
@@ -1068,7 +1087,7 @@ class DragoLauncher(ctk.CTk):
             def install_fabric_and_mod():
                 confirm.destroy()
                 threading.Thread(target=self._install_fabric_then_mod, 
-                               args=(target_version, project_id, project_title),
+                               args=(target_version, project_id, project_title, btn),
                                daemon=True).start()
             
             def cancel():
@@ -1086,9 +1105,9 @@ class DragoLauncher(ctk.CTk):
             return  # Wait for user decision
         
         # If already has mod loader, proceed normally
-        self._download_and_install_mod(project_id, target_version, project_title)
+        self._download_and_install_mod(project_id, target_version, project_title, btn)
     
-    def _install_fabric_then_mod(self, mc_version, mod_project_id, mod_title):
+    def _install_fabric_then_mod(self, mc_version, mod_project_id, mod_title, btn=None):
         """Install Fabric, then install the mod"""
         try:
             self._update_ui_status(f"Installing Fabric for MC {mc_version}...", "#3498db")
@@ -1122,7 +1141,7 @@ class DragoLauncher(ctk.CTk):
             time.sleep(1)
             
             # Now install the mod
-            self._download_and_install_mod(mod_project_id, mc_version, mod_title)
+            self._download_and_install_mod(mod_project_id, mc_version, mod_title, btn)
             
             # Refresh version dropdown to show new Fabric version
             self.after(0, self._refresh_version_dropdown)
@@ -1133,7 +1152,7 @@ class DragoLauncher(ctk.CTk):
             import traceback
             traceback.print_exc()
     
-    def _download_and_install_mod(self, project_id, target_version, project_title):
+    def _download_and_install_mod(self, project_id, target_version, project_title, btn=None):
         """Download and install a mod (separated for reuse)"""
         import requests
         import shutil
@@ -1378,6 +1397,81 @@ class DragoLauncher(ctk.CTk):
         except subprocess.CalledProcessError as e:
             self._update_ui_status("OptiFine extraction failed!", "#e74c3c")
             print(f"Extraction Error: {e}")
+
+    def check_for_updates(self, silent=False):
+        def _check():
+            try:
+                import requests
+                # Replace these to match your repository exactly
+                resp = requests.get("https://api.github.com/repos/GhiathBr/Drago-Launcher/releases/latest", timeout=5)
+                if resp.status_code == 404:
+                     return # no releases yet
+                     
+                latest_release = resp.json()
+                latest_version = latest_release.get("tag_name", self.CURRENT_VERSION)
+                
+                if latest_version != self.CURRENT_VERSION and latest_version.startswith("v"):
+                    # We have an update
+                    self.after(0, lambda: self.prompt_for_update(latest_release))
+                elif not silent:
+                    self.after(0, lambda: self._update_ui_status("You are on the latest version!", "#27ae60"))
+            except Exception as e:
+                pass
+        threading.Thread(target=_check, daemon=True).start()
+        
+    def prompt_for_update(self, release_data):
+        import tkinter.messagebox as messagebox
+        import requests
+        import sys
+        
+        latest_version = release_data.get("tag_name")
+        assets = release_data.get("assets", [])
+        
+        # Look for executable asset
+        exe_url = None
+        for asset in assets:
+            if asset["name"].endswith(".exe"):
+                exe_url = asset["browser_download_url"]
+                break
+                
+        if not exe_url:
+             return
+             
+        if messagebox.askyesno("Update Available", f"A new version ({latest_version}) is available!\nDo you want to update now?"):
+            self._update_ui_status("Downloading update...", "#f39c12")
+            
+            def _download_and_apply():
+                try:
+                    # Download the new executable
+                    new_exe_data = requests.get(exe_url).content
+                    update_exe_path = "DragoLauncher_Update.exe"
+                    
+                    with open(update_exe_path, "wb") as f:
+                        f.write(new_exe_data)
+                        
+                    # Build an updater batch script
+                    bat_path = "updater.bat"
+                    current_exe = os.path.basename(sys.executable)
+                    
+                    # If running natively as Python instead of compiled pyinstaller, just run the new exe.
+                    if not getattr(sys, 'frozen', False):
+                         self.after(0, lambda: self._update_ui_status("Can't auto-update python scripts.", "#e74c3c"))
+                         return
+                         
+                    with open(bat_path, "w") as f:
+                        f.write(f'''@echo off
+timeout /t 2 /nobreak >nul
+del "{current_exe}"
+rename "DragoLauncher_Update.exe" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+''')
+                    import subprocess
+                    subprocess.Popen(bat_path, shell=True)
+                    self.after(0, self.destroy)
+                except Exception as e:
+                    self.after(0, lambda: self._update_ui_status("Update failed!", "#e74c3c"))
+            threading.Thread(target=_download_and_apply, daemon=True).start()
 
     def open_settings(self):
         settings_window = ctk.CTkToplevel(self)

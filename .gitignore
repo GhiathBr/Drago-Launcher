@@ -1,0 +1,17 @@
+# Ignore everything
+*
+
+# Allow directories to be traversed
+!*/
+
+# Explicitly ignore specific directories
+build/
+dist/
+__pycache__/
+.vscode/
+venv/
+env/
+
+# Allow explicitly tracked files
+!*.py
+!.gitignore
