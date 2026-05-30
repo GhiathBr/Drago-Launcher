@@ -4,22 +4,33 @@ import subprocess
 import os
 import sys
 import threading
+import queue
+import asyncio
 import json
 import requests
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 from instance_manager import InstanceManager
+from auth import XSTSIdentityManager, AuthError
+from loader_installer import install_loader, get_loader_versions, AVAILABLE_LOADERS, get_loader_display_name
+from java_manager import scan_java_installations, get_java_for_mc_version, suggest_java_for_instance
+from backup_manager import BackupManager
+from theme_manager import apply_theme, get_theme_names, THEMES, DEFAULT_THEME
+from console_viewer import spawn_console
+from modpack_manager import import_mrpack
+import portable as portable_mode
 
-# Suppress insecure request warnings and globally disable SSL verification
-# This bypasses strict antivirus/firewall deep packet inspection (e.g. Avast) that breaks downloads
-warnings.simplefilter('ignore', InsecureRequestWarning)
-original_request = requests.Session.request
-
-def patched_request(self, method, url, **kwargs):
-    kwargs['verify'] = False
-    return original_request(self, method, url, **kwargs)
-
-requests.Session.request = patched_request
+# SSL verification: disabled by default for antivirus/firewall compatibility,
+# but can be enabled in settings for security
+SSL_VERIFY = os.environ.get("DRAGO_SSL_VERIFY", "0") == "1"
+if not SSL_VERIFY:
+    warnings.simplefilter('ignore', InsecureRequestWarning)
+    original_request = requests.Session.request
+    def patched_request(self, method, url, **kwargs):
+        if "verify" not in kwargs:
+            kwargs['verify'] = False
+        return original_request(self, method, url, **kwargs)
+    requests.Session.request = patched_request
 
 # --- APP SETUP ---
 ctk.set_appearance_mode("dark")
@@ -33,37 +44,68 @@ class DragoLauncher(ctk.CTk):
         self.geometry("900x600")
         self.minsize(800, 500)
         
-        self.CURRENT_VERSION = "v1.2"
-        
-        # Load Config from AppData/.minecraft globally (hiding it)
-        mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+        self.CURRENT_VERSION = "v2.0.0"
+
+        # --- Portable mode detection ---
+        launcher_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, 'frozen', False) else os.getcwd()
+        self.launcher_dir = launcher_dir
+        self.using_portable = portable_mode.is_portable()
+
+        # Determine minecraft directory and config location
+        if self.using_portable:
+            mine_dir = portable_mode.get_minecraft_dir(launcher_dir)
+            self.config_file = os.path.join(launcher_dir, portable_mode.CONFIG_FILENAME)
+        else:
+            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            self.config_file = os.path.join(mine_dir, "drago_launcher_config.json")
+
         if not os.path.exists(mine_dir):
             os.makedirs(mine_dir, exist_ok=True)
-            
-        self.config_file = os.path.join(mine_dir, "drago_launcher_config.json")
-        
+
         # Keep backward compatibility by moving an old config if it exists alongside the app
-        old_config_file = "drago_launcher_config.json"
-        if os.path.exists(old_config_file) and not os.path.exists(self.config_file):
+        old_config_file = os.path.join(launcher_dir, "drago_launcher_config.json")
+        if os.path.exists(old_config_file) and not os.path.exists(self.config_file) and not self.using_portable:
             import shutil
             shutil.move(old_config_file, self.config_file)
-            
-        self.config = {"last_version": "", "memory": 6, "current_instance": None, "use_global_minecraft": True}
+
+        self.config = {
+            "last_version": "", "memory": 6, "current_instance": None,
+            "use_global_minecraft": True, "theme": DEFAULT_THEME,
+            "safe_mode": False, "show_console": True, "ssl_verify": SSL_VERIFY,
+            "portable_mode": self.using_portable, "auto_backup": True,
+        }
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r") as f:
                     self.config.update(json.load(f))
             except Exception:
                 pass
-        
+
+        # Apply saved theme
+        saved_theme = self.config.get("theme", DEFAULT_THEME)
+        if saved_theme in THEMES:
+            apply_theme(saved_theme)
+
         # Set default to global .minecraft if not explicitly configured
         if "use_global_minecraft" not in self.config:
             self.config["use_global_minecraft"] = True
             self._save_config()
-        
-        # Initialize Instance Manager
-        self.instance_manager = InstanceManager()
-        
+
+        # Initialize Instance Manager (respect portable mode)
+        if self.using_portable:
+            data_dir = portable_mode.get_data_dir(launcher_dir)
+            self.instance_manager = InstanceManager(base_dir=data_dir)
+        else:
+            self.instance_manager = InstanceManager()
+
+        # Initialize Backup Manager
+        instances_base = self.instance_manager.base_dir
+        self.backup_manager = BackupManager(str(self.instance_manager.instances_dir))
+
+        # Cache Java installations
+        self.java_installations = scan_java_installations()
+        self._java_scan_thread = None
+
         # Only create default instance if user explicitly chose instance mode
         if not self.config.get("use_global_minecraft"):
             if not self.instance_manager.get_all_instances():
@@ -74,7 +116,7 @@ class DragoLauncher(ctk.CTk):
                 )
                 self.config["current_instance"] = default_id
                 self._save_config()
-            
+
             # Set current instance
             if not self.config.get("current_instance"):
                 instances = self.instance_manager.get_all_instances()
@@ -148,8 +190,11 @@ class DragoLauncher(ctk.CTk):
         self.btn_update = ctk.CTkButton(self.sidebar_frame, text="Check for Updates", fg_color="#2ecc71", anchor="w", command=self.check_for_updates)
         self.btn_update.grid(row=5, column=0, padx=20, pady=10)
 
+        self.btn_import_modpack = ctk.CTkButton(self.sidebar_frame, text="Import Modpack", fg_color="#9b59b6", anchor="w", command=self.import_modpack_dialog)
+        self.btn_import_modpack.grid(row=6, column=0, padx=20, pady=10)
+
         self.btn_settings = ctk.CTkButton(self.sidebar_frame, text="Settings", fg_color="#1f538d", anchor="w", command=self.open_settings)
-        self.btn_settings.grid(row=6, column=0, padx=20, pady=20)
+        self.btn_settings.grid(row=7, column=0, padx=20, pady=20)
 
     def setup_instances_page(self):
         """Setup the instances management page"""
@@ -173,6 +218,9 @@ class DragoLauncher(ctk.CTk):
         
         ctk.CTkButton(btn_frame, text="Import", fg_color="#3498db", hover_color="#2980b9",
                      command=self.import_instance_dialog, width=80).pack(side="left", padx=5)
+
+        ctk.CTkButton(btn_frame, text="Export", fg_color="#e67e22", hover_color="#d35400",
+                     command=self.export_instance_dialog, width=80).pack(side="left", padx=5)
         
         # Scrollable instances list
         self.instances_scroll = ctk.CTkScrollableFrame(self.instances_frame, fg_color="#1e1e1e")
@@ -285,66 +333,125 @@ class DragoLauncher(ctk.CTk):
         """Open dialog to create a new instance"""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Create New Instance")
-        dialog.geometry("450x450")  # Increased from 400 to 450
+        dialog.geometry("500x550")
         dialog.transient(self)
         dialog.grab_set()
-        dialog.resizable(False, False)  # Prevent resizing
-        
+        dialog.resizable(False, False)
+
         ctk.CTkLabel(dialog, text="Create New Instance", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=20)
-        
+
         # Name
         ctk.CTkLabel(dialog, text="Instance Name:").pack(pady=(10, 0))
-        name_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="My Awesome Instance")
+        name_entry = ctk.CTkEntry(dialog, width=350, placeholder_text="My Awesome Instance")
         name_entry.pack(pady=5)
-        
+
         # Version
         ctk.CTkLabel(dialog, text="Minecraft Version:").pack(pady=(10, 0))
         version_var = ctk.StringVar(value="1.20.1")
-        
-        # Get available versions
         available_versions = ["1.20.1", "1.19.4", "1.18.2", "1.16.5", "1.12.2"]
         try:
-            online_versions = [v['id'] for v in minecraft_launcher_lib.utils.get_version_list() 
-                             if v['type'] == 'release'][:20]
+            online_versions = [v['id'] for v in minecraft_launcher_lib.utils.get_version_list()
+                             if v['type'] == 'release'][:30]
             available_versions = online_versions
         except:
             pass
-        
-        version_menu = ctk.CTkOptionMenu(dialog, variable=version_var, values=available_versions, width=300)
+        version_menu = ctk.CTkOptionMenu(dialog, variable=version_var, values=available_versions, width=350)
         version_menu.pack(pady=5)
-        
+
         # Loader
         ctk.CTkLabel(dialog, text="Mod Loader:").pack(pady=(10, 0))
         loader_var = ctk.StringVar(value="vanilla")
-        loader_menu = ctk.CTkOptionMenu(dialog, variable=loader_var, 
-                                       values=["vanilla", "fabric", "forge", "quilt", "neoforge"], 
-                                       width=300)
+        loader_menu = ctk.CTkOptionMenu(dialog, variable=loader_var,
+                                       values=AVAILABLE_LOADERS, width=350)
         loader_menu.pack(pady=5)
+
+        # Loader version (shown when non-vanilla selected)
+        loader_version_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        loader_version_frame.pack(pady=5, fill="x", padx=20)
+        loader_version_label = ctk.CTkLabel(loader_version_frame, text="Loader Version:", text_color="#aaaaaa")
+        loader_version_var = ctk.StringVar(value="latest")
+        loader_version_menu = ctk.CTkOptionMenu(loader_version_frame, variable=loader_version_var,
+                                               values=["latest"], width=350)
         
+        def on_loader_change(choice):
+            if choice == "vanilla":
+                loader_version_label.pack_forget()
+                loader_version_menu.pack_forget()
+            else:
+                loader_version_label.pack(pady=(5, 0))
+                loader_version_menu.pack(pady=5)
+                loader_version_menu.configure(values=["Fetching..."])
+                loader_version_var.set("Fetching...")
+                threading.Thread(target=lambda: _fetch_loader_versions(choice), daemon=True).start()
+
+        def _fetch_loader_versions(loader):
+            try:
+                mc_ver = version_var.get()
+                versions = get_loader_versions(loader, mc_ver)
+                def update():
+                    if versions:
+                        items = [v["display"] for v in versions[:20]]
+                        loader_version_menu.configure(values=items)
+                        loader_version_var.set(items[0] if items else "latest")
+                    else:
+                        loader_version_menu.configure(values=["latest"])
+                        loader_version_var.set("latest")
+                self.after(0, update)
+            except Exception as e:
+                self.after(0, lambda: loader_version_menu.configure(values=["latest"]) or loader_version_var.set("latest"))
+
+        loader_menu.configure(command=on_loader_change)
+
+        def on_version_change(choice):
+            if loader_var.get() != "vanilla":
+                threading.Thread(target=lambda: _fetch_loader_versions(loader_var.get()), daemon=True).start()
+
+        version_menu.configure(command=on_version_change)
+
+        # Java info (auto-detected)
+        java_info_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        java_info_frame.pack(pady=5, fill="x", padx=20)
+        java_info_label = ctk.CTkLabel(java_info_frame, text="", text_color="#aaaaaa", font=ctk.CTkFont(size=11))
+
+        def _update_java_info(*args):
+            mc_ver = version_var.get()
+            needed = get_java_for_mc_version(mc_ver)
+            java_info_label.configure(text=f"Requires Java {needed}+  |  {len(self.java_installations)} Java(s) detected")
+            java_info_label.pack()
+
+        version_var.trace_add("write", _update_java_info)
+        self.after(100, _update_java_info)
+
         # Buttons
         btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_frame.pack(pady=30)
-        
+        btn_frame.pack(pady=20)
+
         def create():
             name = name_entry.get().strip()
             if not name:
                 name = f"Instance {len(self.instance_manager.get_all_instances()) + 1}"
-            
+
+            loader = loader_var.get()
+            loader_ver = None
+            if loader != "vanilla" and loader_version_var.get() != "latest":
+                loader_ver = loader_version_var.get()
+
             instance_id = self.instance_manager.create_instance(
                 name=name,
                 version=version_var.get(),
-                loader=loader_var.get()
+                loader=loader,
+                loader_version=loader_ver,
             )
-            
+
             self.config["current_instance"] = instance_id
             self._save_config()
             self.refresh_instances_list()
             dialog.destroy()
             self._update_ui_status(f"Created instance: {name}", "#27ae60")
-        
+
         ctk.CTkButton(btn_frame, text="Create", fg_color="#27ae60", hover_color="#2ecc71",
                      command=create, width=120).pack(side="left", padx=10)
-        
+
         ctk.CTkButton(btn_frame, text="Cancel", fg_color="#555555", hover_color="#444444",
                      command=dialog.destroy, width=120).pack(side="left", padx=10)
     
@@ -407,83 +514,154 @@ class DragoLauncher(ctk.CTk):
         """Open settings dialog for an instance"""
         instance = self.instance_manager.get_instance(instance_id)
         settings = instance['settings']
-        
+
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Settings - {instance['name']}")
-        dialog.geometry("520x720")  # Increased width and height for better spacing
+        dialog.geometry("560x900")
         dialog.transient(self)
-        dialog.resizable(False, False)  # Prevent resizing
-        
-        # Main container with fixed button at bottom
+        dialog.resizable(False, False)
+
         main_container = ctk.CTkFrame(dialog, fg_color="transparent")
         main_container.pack(fill="both", expand=True, padx=20, pady=20)
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
-        
-        # Scrollable content
+
         scroll = ctk.CTkScrollableFrame(main_container, fg_color="transparent")
         scroll.grid(row=0, column=0, sticky="nsew")
-        
+
         ctk.CTkLabel(scroll, text=f"Instance Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 20))
-        
+
         # Name
         ctk.CTkLabel(scroll, text="Instance Name:", anchor="w").pack(fill="x", pady=(10, 0))
         name_entry = ctk.CTkEntry(scroll, width=400)
         name_entry.insert(0, instance['name'])
         name_entry.pack(pady=5)
-        
+
         # Favorite toggle
         favorite_var = ctk.BooleanVar(value=instance.get('favorite', False))
-        ctk.CTkCheckBox(scroll, text="⭐ Mark as Favorite", variable=favorite_var).pack(pady=10)
-        
+        ctk.CTkCheckBox(scroll, text="⭐ Mark as Favorite", variable=favorite_var).pack(pady=5)
+
         # RAM Settings
-        ctk.CTkLabel(scroll, text="RAM Allocation:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(20, 5))
-        
+        ctk.CTkLabel(scroll, text="RAM Allocation:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(15, 5))
+
         ram_min_var = ctk.IntVar(value=settings.get('ram_min', 2))
         ram_max_var = ctk.IntVar(value=settings.get('ram_max', 4))
-        
+
         ctk.CTkLabel(scroll, text="Minimum RAM (GB):").pack(pady=(5, 0))
         ram_min_slider = ctk.CTkSlider(scroll, from_=1, to=16, number_of_steps=15, variable=ram_min_var)
         ram_min_slider.pack(pady=5)
         ram_min_label = ctk.CTkLabel(scroll, text=f"{ram_min_var.get()} GB")
         ram_min_label.pack()
-        
+
         ctk.CTkLabel(scroll, text="Maximum RAM (GB):").pack(pady=(10, 0))
         ram_max_slider = ctk.CTkSlider(scroll, from_=2, to=32, number_of_steps=30, variable=ram_max_var)
         ram_max_slider.pack(pady=5)
         ram_max_label = ctk.CTkLabel(scroll, text=f"{ram_max_var.get()} GB")
         ram_max_label.pack()
-        
+
         def update_ram_labels(val):
             ram_min_label.configure(text=f"{int(ram_min_var.get())} GB")
             ram_max_label.configure(text=f"{int(ram_max_var.get())} GB")
-        
+
         ram_min_slider.configure(command=update_ram_labels)
         ram_max_slider.configure(command=update_ram_labels)
-        
+
         # Resolution
-        ctk.CTkLabel(scroll, text="Window Resolution:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(20, 5))
-        
+        ctk.CTkLabel(scroll, text="Window Resolution:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(15, 5))
+
         res_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         res_frame.pack(fill="x", pady=5)
-        
+
         width_var = ctk.StringVar(value=str(settings.get('resolution_width', 854)))
         height_var = ctk.StringVar(value=str(settings.get('resolution_height', 480)))
-        
+
         ctk.CTkEntry(res_frame, textvariable=width_var, width=100, placeholder_text="Width").pack(side="left", padx=5)
         ctk.CTkLabel(res_frame, text="×").pack(side="left")
         ctk.CTkEntry(res_frame, textvariable=height_var, width=100, placeholder_text="Height").pack(side="left", padx=5)
-        
+
         fullscreen_var = ctk.BooleanVar(value=settings.get('fullscreen', False))
         ctk.CTkCheckBox(scroll, text="Start in Fullscreen", variable=fullscreen_var).pack(pady=5)
-        
+
+        # --- Java Section ---
+        ctk.CTkLabel(scroll, text="Java Settings:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(15, 5))
+
+        mc_version = instance.get("version", "1.20.1")
+        required_java = get_java_for_mc_version(mc_version)
+
+        java_info_text = f"MC {mc_version} requires Java {required_java}+"
+        if self.java_installations:
+            detected = [j for j in self.java_installations if j["version"] == required_java]
+            if detected:
+                java_info_text += f"  ✓ Java {required_java} found: {detected[0]['vendor']}"
+            else:
+                versions = {j["version"] for j in self.java_installations}
+                java_info_text += f"  ⚠ Found: Java {', '.join(str(v) for v in sorted(versions))}"
+        else:
+            java_info_text += "  ⚠ No Java detected on system"
+
+        ctk.CTkLabel(scroll, text=java_info_text, text_color="#aaaaaa", font=ctk.CTkFont(size=11)).pack(pady=5)
+
         # Java Path
-        ctk.CTkLabel(scroll, text="Java Path (leave empty for auto):", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(20, 5))
-        java_entry = ctk.CTkEntry(scroll, width=400, placeholder_text="Auto-detect")
+        ctk.CTkLabel(scroll, text="Java Path (leave empty for auto-detect):", anchor="w").pack(fill="x", pady=(5, 0))
+        java_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        java_frame.pack(fill="x", pady=5)
+        java_entry = ctk.CTkEntry(java_frame, width=320, placeholder_text="Auto-detect")
         if settings.get('java_path'):
             java_entry.insert(0, settings['java_path'])
-        java_entry.pack(pady=5)
-        
+        java_entry.pack(side="left", padx=(0, 5))
+
+        def browse_java():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(title="Select Java Executable",
+                                              filetypes=[("Java", "java.exe"), ("All Files", "*.*")])
+            if path:
+                java_entry.delete(0, "end")
+                java_entry.insert(0, path)
+        ctk.CTkButton(java_frame, text="Browse", width=70, fg_color="#3498db",
+                      command=browse_java).pack(side="left")
+
+        # Safe Mode toggle
+        ctk.CTkLabel(scroll, text="Launch Options:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(15, 5))
+        safe_mode_var = ctk.BooleanVar(value=instance.get('settings', {}).get('safe_mode', False))
+        ctk.CTkCheckBox(scroll, text="🔒 Safe Mode (launch without mods/shaders/resourcepacks)",
+                        variable=safe_mode_var).pack(pady=5)
+
+        # --- Backup Section ---
+        ctk.CTkLabel(scroll, text="Backups:", anchor="w", font=ctk.CTkFont(weight="bold")).pack(fill="x", pady=(15, 5))
+
+        backup_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        backup_frame.pack(fill="x", pady=5)
+
+        backup_count = len(self.backup_manager.get_backups_for_instance(instance_id))
+        ctk.CTkLabel(backup_frame, text=f"{backup_count} backup(s) for this instance",
+                     text_color="#aaaaaa").pack(side="left", padx=(0, 10))
+
+        def do_backup():
+            def _backup():
+                bid = self.backup_manager.create_backup(instance_id, name=f"Manual {instance['name']}")
+                if bid:
+                    self.after(0, lambda: self._update_ui_status(f"Backup created!", "#27ae60"))
+                else:
+                    self.after(0, lambda: self._update_ui_status("Backup failed", "#e74c3c"))
+            threading.Thread(target=_backup, daemon=True).start()
+
+        ctk.CTkButton(backup_frame, text="Backup Now", width=100, fg_color="#e67e22",
+                     command=do_backup).pack(side="left", padx=5)
+
+        def restore_backup():
+            backups = self.backup_manager.get_backups_for_instance(instance_id)
+            if not backups:
+                self._update_ui_status("No backups to restore", "#e74c3c")
+                return
+            latest = backups[0]
+            if self.backup_manager.restore_backup(latest["id"], instance_id):
+                self._update_ui_status(f"Restored from {latest['name']}", "#27ae60")
+            else:
+                self._update_ui_status("Restore failed", "#e74c3c")
+
+        ctk.CTkButton(backup_frame, text="Restore Latest", width=100, fg_color="#9b59b6",
+                     command=restore_backup).pack(side="left", padx=5)
+
         # Save button - OUTSIDE scroll frame, fixed at bottom
         def save_settings():
             new_settings = {
@@ -494,21 +672,21 @@ class DragoLauncher(ctk.CTk):
                 'fullscreen': fullscreen_var.get(),
                 'java_path': java_entry.get().strip() or None,
                 'jvm_args': settings.get('jvm_args', []),
-                'game_args': settings.get('game_args', [])
+                'game_args': settings.get('game_args', []),
+                'safe_mode': safe_mode_var.get(),
             }
-            
+
             self.instance_manager.update_instance_settings(instance_id, new_settings)
             self.instance_manager.rename_instance(instance_id, name_entry.get().strip())
             self.instance_manager.set_favorite(instance_id, favorite_var.get())
-            
+
             self.refresh_instances_list()
             dialog.destroy()
             self._update_ui_status("Settings saved", "#27ae60")
-        
-        # Button container at bottom (outside scroll)
+
         button_frame = ctk.CTkFrame(main_container, fg_color="transparent")
         button_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        
+
         ctk.CTkButton(button_frame, text="Save Settings", fg_color="#27ae60", hover_color="#2ecc71",
                      command=save_settings, width=200, height=40).pack(pady=10)
     
@@ -528,6 +706,69 @@ class DragoLauncher(ctk.CTk):
                 self._update_ui_status("Instance imported successfully", "#27ae60")
             else:
                 self._update_ui_status("Failed to import instance", "#e74c3c")
+
+    def export_instance_dialog(self):
+        """Export an instance as a zip file"""
+        from tkinter import filedialog
+        
+        current_id = self.config.get("current_instance")
+        if not current_id:
+            self._update_ui_status("No instance selected to export", "#e74c3c")
+            return
+        
+        instance = self.instance_manager.get_instance(current_id)
+        if not instance:
+            self._update_ui_status("Instance not found", "#e74c3c")
+            return
+        
+        filepath = filedialog.asksaveasfilename(
+            title="Export Instance",
+            defaultextension=".zip",
+            filetypes=[("ZIP Files", "*.zip")],
+            initialfile=f"{instance['name']}.zip"
+        )
+        
+        if filepath:
+            success = self.instance_manager.export_instance(current_id, filepath)
+            if success:
+                self._update_ui_status(f"Exported {instance['name']}", "#27ae60")
+            else:
+                self._update_ui_status("Failed to export instance", "#e74c3c")
+
+    def import_modpack_dialog(self):
+        """Import a Modrinth modpack (.mrpack)"""
+        from tkinter import filedialog, simpledialog
+        
+        filepath = filedialog.askopenfilename(
+            title="Select Modrinth Modpack",
+            filetypes=[("Modrinth Modpack", "*.mrpack"), ("ZIP Files", "*.zip"), ("All Files", "*.*")]
+        )
+        
+        if not filepath:
+            return
+        
+        self._update_ui_status("Importing modpack...", "#f39c12")
+        
+        def do_import():
+            current_id = self.config.get("current_instance")
+            if not current_id:
+                self._update_ui_status("Select an instance first!", "#e74c3c")
+                return
+            
+            instance_path = self.instance_manager.get_instance_path(current_id)
+            if not instance_path:
+                self._update_ui_status("Instance not found!", "#e74c3c")
+                return
+            
+            success, result = import_mrpack(filepath, str(instance_path))
+            
+            if success:
+                self._update_ui_status(f"Modpack '{result}' imported!", "#27ae60")
+                self.after(0, self.load_installed_content)
+            else:
+                self._update_ui_status(f"Import failed: {result}", "#e74c3c")
+        
+        threading.Thread(target=do_import, daemon=True).start()
     
     def _save_config(self):
         """Save launcher config to disk"""
@@ -662,49 +903,76 @@ class DragoLauncher(ctk.CTk):
     def load_installed_content(self):
         for widget in self.installed_scroll.winfo_children():
             widget.destroy()
-        
+
         # Check if using global .minecraft
         use_global = self.config.get("use_global_minecraft", False)
-        
+
         if use_global:
-            # Use global .minecraft directory
             mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
-            ctk.CTkLabel(self.installed_scroll, text="Content for: Global .minecraft", 
+            ctk.CTkLabel(self.installed_scroll, text="Content for: Global .minecraft",
                         font=ctk.CTkFont(size=14, weight="bold"), text_color="#3498db").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 15))
-            
+
             from pathlib import Path
             mods_dir = Path(mine_dir) / "mods"
             saves_dir = Path(mine_dir) / "saves"
         else:
-            # Get current instance
             current_instance_id = self.config.get("current_instance")
             if not current_instance_id:
                 ctk.CTkLabel(self.installed_scroll, text="No instance selected", text_color="#e74c3c").grid(row=0, column=0, pady=20)
                 return
-            
+
             instance = self.instance_manager.get_instance(current_instance_id)
             if not instance:
                 ctk.CTkLabel(self.installed_scroll, text="Instance not found", text_color="#e74c3c").grid(row=0, column=0, pady=20)
                 return
-            
-            # Show current instance name
-            ctk.CTkLabel(self.installed_scroll, text=f"Content for: {instance['name']}", 
+
+            ctk.CTkLabel(self.installed_scroll, text=f"Content for: {instance['name']}",
                         font=ctk.CTkFont(size=14, weight="bold"), text_color="#3498db").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 15))
-            
+
             instance_path = self.instance_manager.get_instance_path(current_instance_id)
             mods_dir = instance_path / "mods"
             saves_dir = instance_path / "saves"
-        
+
         row_idx = 1
         import shutil
-        
+
+        # Drop zone for installing mods
+        drop_frame = ctk.CTkFrame(self.installed_scroll, fg_color="#1a1a2e", corner_radius=8, border_width=2, border_color="#3498db")
+        drop_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=5)
+
+        drop_label = ctk.CTkLabel(drop_frame, text="📁 Drop .jar mods here or click to browse",
+                                  font=ctk.CTkFont(size=12), text_color="#888888")
+        drop_label.pack(pady=10)
+
+        def browse_and_install_mod():
+            from tkinter import filedialog
+            files = filedialog.askopenfilenames(
+                title="Select Mods to Install",
+                filetypes=[("Minecraft Mods", "*.jar"), ("All Files", "*.*")]
+            )
+            if not files:
+                return
+            for fpath in files:
+                try:
+                    dest = mods_dir / os.path.basename(fpath)
+                    os.makedirs(mods_dir, exist_ok=True)
+                    shutil.copy2(fpath, dest)
+                except Exception as e:
+                    print(f"Error installing mod: {e}")
+            self.load_installed_content()
+            self._update_ui_status(f"Installed {len(files)} mod(s)", "#27ae60")
+
+        drop_frame.configure(cursor="hand2")
+        drop_frame.bind("<Button-1>", lambda e: browse_and_install_mod())
+        drop_label.bind("<Button-1>", lambda e: browse_and_install_mod())
+
         def create_item(parent, base_dir, filename, idx):
             item_frame = ctk.CTkFrame(parent, fg_color="#2b2b2b", corner_radius=5)
             item_frame.grid(row=idx, column=0, sticky="ew", pady=3, padx=5)
             item_frame.grid_columnconfigure(0, weight=1)
-            
+
             ctk.CTkLabel(item_frame, text=filename, font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
-            
+
             def delete_item():
                 target = base_dir / filename
                 try:
@@ -715,22 +983,22 @@ class DragoLauncher(ctk.CTk):
                     item_frame.destroy()
                 except Exception as e:
                     print(f"Delete Error: {e}")
-                    
+
             del_btn = ctk.CTkButton(item_frame, text="Delete", width=60, fg_color="#c0392b", hover_color="#e74c3c", command=delete_item)
             del_btn.grid(row=0, column=1, padx=10, pady=5)
 
         # Draw Mods
         if mods_dir.exists() and list(mods_dir.iterdir()):
-            ctk.CTkLabel(self.installed_scroll, text="Installed Mods", text_color="#3498db", font=ctk.CTkFont(weight="bold", size=16)).grid(row=row_idx, column=0, sticky="w", padx=5, pady=(10,5))
+            ctk.CTkLabel(self.installed_scroll, text="Installed Mods", text_color="#3498db", font=ctk.CTkFont(weight="bold", size=16)).grid(row=row_idx, column=0, sticky="w", padx=5, pady=(10, 5))
             row_idx += 1
             for f in mods_dir.iterdir():
                 if f.suffix == ".jar":
                     create_item(self.installed_scroll, mods_dir, f.name, row_idx)
                     row_idx += 1
-                    
+
         # Draw Worlds
         if saves_dir.exists() and list(saves_dir.iterdir()):
-            ctk.CTkLabel(self.installed_scroll, text="Installed Worlds", text_color="#2ecc71", font=ctk.CTkFont(weight="bold", size=16)).grid(row=row_idx, column=0, sticky="w", padx=5, pady=(20,5))
+            ctk.CTkLabel(self.installed_scroll, text="Installed Worlds", text_color="#2ecc71", font=ctk.CTkFont(weight="bold", size=16)).grid(row=row_idx, column=0, sticky="w", padx=5, pady=(20, 5))
             row_idx += 1
             for f in saves_dir.iterdir():
                 if f.is_dir():
@@ -1476,29 +1744,39 @@ del "%~f0"
     def open_settings(self):
         settings_window = ctk.CTkToplevel(self)
         settings_window.title("Settings")
-        settings_window.geometry("420x400")  # Increased height
+        settings_window.geometry("500x700")
         settings_window.transient(self)
         settings_window.resizable(False, False)
-        
-        ctk.CTkLabel(settings_window, text="Launcher Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
-        
-        # Instance Mode Toggle
-        ctk.CTkLabel(settings_window, text="Game Directory Mode:", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 5))
-        
+
+        # Use scrollable frame for all content
+        scroll = ctk.CTkScrollableFrame(settings_window, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(scroll, text="Launcher Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 15))
+
+        # --- Theme Selection ---
+        ctk.CTkLabel(scroll, text="Theme:", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
+        theme_var = ctk.StringVar(value=self.config.get("theme", DEFAULT_THEME))
+        theme_menu = ctk.CTkOptionMenu(scroll, variable=theme_var, values=get_theme_names(), width=300)
+        theme_menu.pack(pady=5)
+
+        # --- Instance Mode Toggle ---
+        ctk.CTkLabel(scroll, text="Game Directory Mode:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+
         use_global_var = ctk.BooleanVar(value=self.config.get("use_global_minecraft", True))
-        
-        mode_frame = ctk.CTkFrame(settings_window, fg_color="transparent")
+
+        mode_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         mode_frame.pack(pady=5)
-        
-        ctk.CTkRadioButton(mode_frame, text="Use Global .minecraft (Default)", 
+
+        ctk.CTkRadioButton(mode_frame, text="Use Global .minecraft (Default)",
                           variable=use_global_var, value=True).pack(anchor="w", padx=20, pady=2)
-        ctk.CTkRadioButton(mode_frame, text="Use Instance System (Advanced)", 
+        ctk.CTkRadioButton(mode_frame, text="Use Instance System (Advanced)",
                           variable=use_global_var, value=False).pack(anchor="w", padx=20, pady=2)
-        
-        ctk.CTkLabel(settings_window, text="⚠️ Changing mode requires restart", 
+
+        ctk.CTkLabel(scroll, text="⚠️ Changing mode requires restart",
                     text_color="#f1c40f", font=ctk.CTkFont(size=10)).pack(pady=5)
-        
-        # Get Max RAM dynamically via built-in Windows API
+
+        # Get Max RAM dynamically
         max_ram = 16
         try:
             import ctypes
@@ -1515,44 +1793,119 @@ del "%~f0"
         except Exception:
             pass
 
-        max_ram = max(2, max_ram) # Ensure slider has a safe minimum bound
+        max_ram = max(2, max_ram)
 
-        # Memory Slider (only for global mode)
-        ctk.CTkLabel(settings_window, text=f"Default RAM (Global Mode Only):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0))
-        ctk.CTkLabel(settings_window, text=f"Max: {max_ram} GB", font=ctk.CTkFont(size=10), text_color="#aaaaaa").pack()
-        
+        # Memory Slider
+        ctk.CTkLabel(scroll, text=f"Default RAM (Global Mode):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0))
+        ctk.CTkLabel(scroll, text=f"Max: {max_ram} GB", font=ctk.CTkFont(size=10), text_color="#aaaaaa").pack()
+
         current_mem = float(self.config.get("memory", 6))
         if current_mem > max_ram:
             current_mem = float(max_ram)
-            
+
         mem_var = ctk.DoubleVar(value=current_mem)
-        
-        mem_label = ctk.CTkLabel(settings_window, text=f"{int(current_mem)} GB", font=ctk.CTkFont(weight="bold"))
-        
+
+        mem_label = ctk.CTkLabel(scroll, text=f"{int(current_mem)} GB", font=ctk.CTkFont(weight="bold"))
+
         def update_mem_label(val):
             mem_label.configure(text=f"{int(val)} GB")
-            
+
         steps = max(1, max_ram - 2)
-        mem_slider = ctk.CTkSlider(settings_window, from_=2, to=max_ram, number_of_steps=steps, variable=mem_var, command=update_mem_label)
+        mem_slider = ctk.CTkSlider(scroll, from_=2, to=max_ram, number_of_steps=steps, variable=mem_var, command=update_mem_label)
         mem_slider.pack(pady=10)
         mem_label.pack()
-        
-        def save_settings():
-            new_mem = int(mem_var.get())
-            self.config["memory"] = new_mem
-            self.config["use_global_minecraft"] = use_global_var.get()
-            try:
-                with open(self.config_file, "w") as f:
-                    json.dump(self.config, f)
-            except Exception: pass
-            settings_window.destroy()
-            
-            # Show restart message if mode changed
-            if use_global_var.get() != self.config.get("use_global_minecraft"):
-                self._update_ui_status("Please restart launcher for mode change", "#f1c40f")
 
-        save_btn = ctk.CTkButton(settings_window, text="Save Settings", fg_color="#27ae60", hover_color="#2ecc71", command=save_settings)
-        save_btn.pack(pady=20)
+        # --- Launch Options ---
+        ctk.CTkLabel(scroll, text="Launch Options:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+        show_console_var = ctk.BooleanVar(value=self.config.get("show_console", True))
+        ctk.CTkCheckBox(scroll, text="Show Game Console on Launch", variable=show_console_var).pack(pady=2)
+        auto_backup_var = ctk.BooleanVar(value=self.config.get("auto_backup", True))
+        ctk.CTkCheckBox(scroll, text="Auto-backup before launching", variable=auto_backup_var).pack(pady=2)
+
+        # --- Security ---
+        ctk.CTkLabel(scroll, text="Security:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+        ssl_verify_var = ctk.BooleanVar(value=self.config.get("ssl_verify", False))
+        ctk.CTkCheckBox(scroll, text="Enable SSL Verification (more secure, may break downloads with some antivirus)",
+                        variable=ssl_verify_var).pack(pady=2)
+
+        # --- Portable Mode ---
+        ctk.CTkLabel(scroll, text="Portable Mode:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+        portable_var = ctk.BooleanVar(value=self.using_portable)
+        ctk.CTkCheckBox(scroll, text="Run in Portable Mode (all data in launcher folder)",
+                        variable=portable_var).pack(pady=2)
+        ctk.CTkLabel(scroll, text="⚠️ Enabling requires restart", text_color="#f1c40f",
+                    font=ctk.CTkFont(size=10)).pack()
+
+        # --- Java Info ---
+        ctk.CTkLabel(scroll, text="Detected Java Installations:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+        if self.java_installations:
+            for j in self.java_installations[:5]:
+                ctk.CTkLabel(scroll, text=f"  Java {j['version']} ({j['vendor']}) - {j['path'][:60]}",
+                            text_color="#aaaaaa", font=ctk.CTkFont(size=10)).pack(anchor="w")
+            if len(self.java_installations) > 5:
+                ctk.CTkLabel(scroll, text=f"  ... and {len(self.java_installations)-5} more",
+                            text_color="#777777", font=ctk.CTkFont(size=10)).pack(anchor="w")
+        else:
+            ctk.CTkLabel(scroll, text="  No Java installations found", text_color="#e74c3c").pack(anchor="w")
+
+        def rescan_java():
+            self._update_ui_status("Scanning for Java...", "#f39c12")
+            def scan():
+                self.java_installations = scan_java_installations()
+                self.after(0, lambda: self._update_ui_status(f"Found {len(self.java_installations)} Java installation(s)", "#27ae60"))
+            threading.Thread(target=scan, daemon=True).start()
+
+        ctk.CTkButton(scroll, text="Rescan Java", width=120, fg_color="#3498db",
+                     command=rescan_java).pack(pady=5)
+
+        # --- Backup Management ---
+        ctk.CTkLabel(scroll, text="Backup Management:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
+        all_backups = self.backup_manager.get_all_backups()
+        ctk.CTkLabel(scroll, text=f"Total backups: {len(all_backups)} ({sum(self.backup_manager._get_dir_size(self.backup_manager.backup_dir / b['id']) for b in all_backups if (self.backup_manager.backup_dir / b['id']).exists()):,} bytes)",
+                    text_color="#aaaaaa", font=ctk.CTkFont(size=11)).pack()
+
+        def cleanup_backups():
+            self.backup_manager.cleanup_old_backups()
+            self._update_ui_status("Cleaned up old backups", "#27ae60")
+        ctk.CTkButton(scroll, text="Cleanup Old Backups", width=160, fg_color="#e67e22",
+                     command=cleanup_backups).pack(pady=5)
+
+        # Save button
+        def save_settings():
+            new_theme = theme_var.get()
+            old_theme = self.config.get("theme", DEFAULT_THEME)
+
+            self.config["memory"] = int(mem_var.get())
+            self.config["use_global_minecraft"] = use_global_var.get()
+            self.config["theme"] = new_theme
+            self.config["show_console"] = show_console_var.get()
+            self.config["auto_backup"] = auto_backup_var.get()
+            self.config["ssl_verify"] = ssl_verify_var.get()
+
+            changed_mode = use_global_var.get() != self.config.get("use_global_minecraft")
+            changed_theme = new_theme != old_theme
+            changed_portable = portable_var.get() != self.using_portable
+
+            self._save_config()
+
+            settings_window.destroy()
+
+            if changed_theme and new_theme in THEMES:
+                apply_theme(new_theme)
+                self._update_ui_status(f"Theme changed to {new_theme}", "#27ae60")
+
+            if changed_mode:
+                self._update_ui_status("Restart required for mode change", "#f1c40f")
+
+            if changed_portable:
+                if portable_var.get():
+                    portable_mode.enable_portable_mode(self.launcher_dir)
+                else:
+                    portable_mode.disable_portable_mode(self.launcher_dir)
+                self._update_ui_status("Restart required for portable mode change", "#f1c40f")
+
+        ctk.CTkButton(scroll, text="Save Settings", fg_color="#27ae60", hover_color="#2ecc71",
+                     command=save_settings, width=200, height=40).pack(pady=20)
 
     def setup_main_feed(self):
         # Main Content Frame (Update Feed)
@@ -1616,6 +1969,10 @@ del "%~f0"
         self.username_entry = ctk.CTkEntry(self.bottom_bar, placeholder_text="Username", width=150)
         self.username_entry.insert(0, "DRAGO")
         self.username_entry.grid(row=0, column=0, padx=(20, 10), pady=10)
+
+        # Login with Microsoft Button
+        self.btn_microsoft_login = ctk.CTkButton(self.bottom_bar, text="Login with MS", width=120, fg_color="#107c10", hover_color="#1f8b22", command=self.start_microsoft_login)
+        self.btn_microsoft_login.grid(row=1, column=0, padx=(20, 10), pady=(0, 10))
 
         # Dynamically fetch versions (Both installed and available online)
         mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
@@ -1762,8 +2119,18 @@ del "%~f0"
         self.update_play_button_text()
     
     def update_play_button_text(self):
-        """Update play button text"""
-        self.play_button.configure(text="▶ PLAY")
+        """Update play button text with instance info"""
+        use_global = self.config.get("use_global_minecraft", False)
+        if use_global:
+            self.play_button.configure(text="▶ PLAY (Global)")
+        else:
+            current_id = self.config.get("current_instance")
+            if current_id:
+                inst = self.instance_manager.get_instance(current_id)
+                if inst:
+                    self.play_button.configure(text=f"▶ PLAY {inst['name'][:20]}")
+                    return
+            self.play_button.configure(text="▶ PLAY")
 
     def set_gpu_preference(self, java_path):
         try:
@@ -1807,6 +2174,57 @@ del "%~f0"
 
     def _update_ui_status(self, text, color):
         self.status_label.configure(text=text, text_color=color)
+
+    def start_microsoft_login(self):
+        self._update_ui_status("Starting Microsoft Login...", "#f39c12")
+        threading.Thread(target=self._microsoft_login_thread, daemon=True).start()
+
+    def _microsoft_login_thread(self):
+        try:
+            # Hardcoded public Client ID for Drago Launcher (Completely safe for public clients)
+            client_id = "ab5dd215-1a94-4383-a5f2-d51d42ab758f"
+            
+            auth_manager = XSTSIdentityManager(client_id=client_id)
+            
+            async def run_device_flow():
+                device_info = await auth_manager.start_device_authorization()
+                user_code = device_info["user_code"]
+                verification_uri = device_info["verification_uri"]
+                interval = device_info.get("interval", 5)
+                device_code = device_info["device_code"]
+                
+                # Copy to clipboard and open browser
+                try:
+                    self.clipboard_clear()
+                    self.clipboard_append(user_code)
+                except Exception:
+                    pass
+                
+                msg = f"Go to {verification_uri} and enter: {user_code} (Copied!)"
+                self.after(0, lambda: self._update_ui_status(msg, "#3498db"))
+                
+                import webbrowser
+                webbrowser.open(verification_uri)
+                
+                # Poll for completion
+                oauth = await auth_manager.poll_device_authorization(device_code, interval)
+                self.after(0, lambda: self._update_ui_status("Authenticating with Minecraft...", "#f39c12"))
+                return await auth_manager.get_minecraft_profile(oauth)
+
+            mc_token, profile = asyncio.run(run_device_flow())
+            
+            self.authenticated_xuid = profile["id"]
+            self.authenticated_token = mc_token
+            name = profile["name"]
+            
+            # Update UI on success
+            self.after(0, lambda n=name: self._update_ui_status(f"Logged in as {n}", "#27ae60"))
+            self.after(0, lambda: self.username_entry.delete(0, 'end'))
+            self.after(0, lambda n=name: self.username_entry.insert(0, n))
+            
+        except Exception as e:
+            err = str(e)
+            self.after(0, lambda msg=err: self._update_ui_status(f"Login error: {msg}", "#c0392b"))
 
     def _install_progress_callback(self, current, max_val):
         # Calculate percentage
@@ -1911,6 +2329,44 @@ del "%~f0"
             with open(self.config_file, "w") as f:
                 json.dump(self.config, f)
 
+        # --- Safe Mode: temporarily disable mods/shaders/resourcepacks ---
+        safe_mode = False
+        if not use_global and instance:
+            safe_mode = instance.get('settings', {}).get('safe_mode', False) or self.config.get("safe_mode", False)
+
+        if safe_mode and not use_global:
+            self._update_ui_status("🔒 Safe Mode: disabling mods/shaders/resourcepacks...", "#f39c12")
+            import shutil
+            import tempfile
+            instance_path = Path(mine_dir)
+            safe_mode_backups = {}
+            for folder in ["mods", "shaderpacks"]:
+                src = instance_path / folder
+                if src.exists():
+                    backup_path = Path(tempfile.gettempdir()) / f"drago_safe_{folder}"
+                    if backup_path.exists():
+                        shutil.rmtree(backup_path)
+                    shutil.copytree(src, backup_path)
+                    safe_mode_backups[folder] = backup_path
+                    for item in src.iterdir():
+                        if item.is_file() or item.is_dir():
+                            if item.is_dir():
+                                shutil.rmtree(item)
+                            else:
+                                item.unlink()
+            rp_dir = instance_path / "resourcepacks"
+            if rp_dir.exists():
+                rp_backup = Path(tempfile.gettempdir()) / "drago_safe_resourcepacks"
+                if rp_backup.exists():
+                    shutil.rmtree(rp_backup)
+                shutil.copytree(rp_dir, rp_backup)
+                safe_mode_backups["resourcepacks"] = rp_backup
+
+        # --- Auto-backup before launch ---
+        if not use_global and self.config.get("auto_backup", True):
+            self._update_ui_status("Creating pre-launch backup...", "#f39c12")
+            self.backup_manager.auto_backup_before_launch(current_instance_id)
+
         try:
             # Check for Optifine installation
             if "OptiFine" in version:
@@ -1951,7 +2407,7 @@ del "%~f0"
                 ram_max = settings.get('ram_max', 4)
                 # Match Xms to Xmx per requirement
                 ram_min = ram_max
-            
+
             # Build JVM arguments
             jvm_args = [
                 f"-Xmx{ram_max}G",
@@ -1964,7 +2420,7 @@ del "%~f0"
                 "-XX:G1HeapRegionSize=32M",
                 "-Dcustomskinloader.enabled=true"
             ]
-            
+
             # Add custom JVM args from instance if not using global
             if not use_global and instance.get('settings', {}).get('jvm_args'):
                 jvm_args.extend(instance['settings']['jvm_args'])
@@ -1981,16 +2437,20 @@ del "%~f0"
             # Launch options
             options = {
                 "username": name,
-                "uuid": current_uuid,
-                "token": "FML",
+                "uuid": getattr(self, "authenticated_xuid", current_uuid),
+                "token": getattr(self, "authenticated_token", "FML"),
                 "jvmArguments": jvm_args,
                 "launcher_name": "minecraft-launcher",
                 "launcher_version": "3.32.9",
                 "userType": "mojang" if is_legacy else "msa",
                 "versionType": "release",
-                "demo": False
+                "demo": False,
+                "meta": {
+                    "demo": False,
+                    "custom": True
+                }
             }
-            
+
             # Add resolution settings if using instance system
             if not use_global and instance:
                 settings = instance['settings']
@@ -1998,7 +2458,7 @@ del "%~f0"
                     options['customResolution'] = True
                     options['resolutionWidth'] = str(settings['resolution_width'])
                     options['resolutionHeight'] = str(settings['resolution_height'])
-                
+
                 if settings.get('fullscreen'):
                     options['fullscreen'] = True
 
@@ -2043,12 +2503,15 @@ del "%~f0"
                 if idx + 1 < len(command):
                     command[idx + 1] = "release"
 
-            # Use instance-specific or detected Java path
+            # Smart Java path selection
             if use_global:
                 java_path = minecraft_launcher_lib.utils.get_java_executable()
             else:
-                java_path = instance['settings'].get('java_path') or minecraft_launcher_lib.utils.get_java_executable()
-            
+                java_path = instance['settings'].get('java_path')
+                if not java_path:
+                    suggested = suggest_java_for_instance(self.java_installations, instance.get('version', version))
+                    java_path = suggested or minecraft_launcher_lib.utils.get_java_executable()
+
             if java_path:
                 command[0] = java_path
                 # Automate GPU Preference to High Performance (2)
@@ -2064,11 +2527,21 @@ del "%~f0"
             self.progress_bar.pack_forget()
             self.play_button.configure(state="normal")
 
-            process = subprocess.Popen(command)
-            
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            )
+
+            # Show console viewer if enabled
+            console_viewer = None
+            if self.config.get("show_console", True):
+                console_viewer = spawn_console(self, process, title=f"Minecraft - {launch_name}")
+
             # Process Priority (High = 0x00000080)
-            # CAUTION: We REMOVED the CPU Affinity mask (0x0F) because forcing Minecraft 
-            # to only use 4 cores severely chokes chunk rendering and world generation.
             try:
                 import ctypes
                 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -2079,14 +2552,29 @@ del "%~f0"
                     print(f"Successfully applied Priority High to PID {process.pid}")
             except Exception as priority_err:
                 print(f"Failed to set CPU properties: {priority_err}")
-            
+
             # Update play stats if using instance system
             if not use_global:
                 self.instance_manager.update_play_stats(current_instance_id, 0)
-            
+
             self._update_ui_status("Game Running!", "#27ae60")
-            
+
             process.wait()
+
+            # Restore safe mode files
+            if safe_mode and not use_global:
+                try:
+                    import shutil
+                    for folder, backup_path in safe_mode_backups.items():
+                        target = instance_path / folder
+                        if backup_path.exists():
+                            if target.exists():
+                                shutil.rmtree(target)
+                            shutil.copytree(backup_path, target)
+                            shutil.rmtree(backup_path)
+                except Exception as e:
+                    print(f"Safe mode restore error: {e}")
+
             self._update_ui_status("Ready to play", "#aaaaaa")
 
         except Exception as e:
@@ -2095,6 +2583,19 @@ del "%~f0"
             import traceback
             traceback.print_exc()
             self.play_button.configure(state="normal")
+
+            # Restore safe mode files on error
+            if safe_mode and not use_global:
+                try:
+                    for folder, backup_path in safe_mode_backups.items():
+                        target = instance_path / folder
+                        if backup_path.exists():
+                            if target.exists():
+                                shutil.rmtree(target)
+                            shutil.copytree(backup_path, target)
+                            shutil.rmtree(backup_path)
+                except Exception:
+                    pass
     def verify_version(self):
         version = self.version_var.get()
         if not version or version == "No versions found":

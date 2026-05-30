@@ -108,6 +108,65 @@ class XSTSIdentityManager:
         xbl = await self._exchange_for_xbl(oauth.access_token)
         return await self._exchange_for_xsts(xbl["token"])
 
+    async def start_device_authorization(self) -> dict[str, Any]:
+        """Start the device code flow and return the user code and verification URI."""
+        if not self.client_id or not isinstance(self.client_id, str):
+            raise ValueError("A valid Client ID string must be present to initiate device authorization.")
+            
+        url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+        return await self._post_form(url, {
+            "client_id": self.client_id,
+            "scope": self.scope
+        })
+
+    async def poll_device_authorization(self, device_code: str, interval: int) -> OAuthTokens:
+        """Poll the token endpoint until the user completes the device authentication."""
+        url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+        payload = {
+            "client_id": self.client_id,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code
+        }
+        
+        while True:
+            try:
+                data = await self._post_form(url, payload)
+                return OAuthTokens(
+                    access_token=data["access_token"],
+                    refresh_token=data.get("refresh_token"),
+                    expires_at=time.time() + data.get("expires_in", 3600)
+                )
+            except AuthError as e:
+                if "authorization_pending" in str(e):
+                    await asyncio.sleep(interval)
+                elif "expired_token" in str(e):
+                    raise AuthError("The device code has expired. Please try again.") from e
+                else:
+                    raise e
+
+    async def get_minecraft_profile(self, oauth: OAuthTokens) -> tuple[str, dict]:
+        """Gets the Xbox token and then fetches the Minecraft token and profile."""
+        xbl = await self._exchange_for_xbl(oauth.access_token)
+        xsts = await self._exchange_for_xsts(xbl["token"])
+        
+        # Authenticate with Minecraft using XSTS token
+        mc_auth_url = "https://api.minecraftservices.com/authentication/login_with_xbox"
+        mc_auth_payload = {
+            "identityToken": f"XBL3.0 x={xsts.uhs};{xsts.user_token}"
+        }
+        mc_data = await self._post_json(mc_auth_url, mc_auth_payload)
+        mc_access_token = mc_data["access_token"]
+        
+        # Get Minecraft profile
+        profile_url = "https://api.minecraftservices.com/minecraft/profile"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(profile_url, headers={"Authorization": f"Bearer {mc_access_token}"}) as r:
+                if r.status != 200:
+                    raise AuthError(f"Failed to fetch Minecraft profile: {r.status}")
+                profile = await r.json()
+                
+        return mc_access_token, profile
+
     async def authenticate(
         self,
         *,
@@ -152,9 +211,9 @@ class XSTSIdentityManager:
         data = await self._post_json(XSTS_AUTH_URL, payload, headers={"x-xbl-contract-version": "1"})
         try:
             user_token = data["Token"]
-            xui = data["DisplayClaims"]["xui"][0]
-            xuid = xui["xid"]
-            uhs = xui["uhs"]
+            xui = data.get("DisplayClaims", {}).get("xui", [{}])[0]
+            xuid = xui.get("xid", "")  # Often absent depending on account type/Xbox profile creation
+            uhs = xui.get("uhs", "")
         except (KeyError, IndexError, TypeError) as e:
             raise AuthError(f"Malformed XSTS response: {data}") from e
         return XSTSResult(user_token=user_token, xuid=xuid, uhs=uhs)
@@ -183,13 +242,13 @@ class XSTSIdentityManager:
 
 # ---- Example CLI usage ----
 # pip install aiohttp
-# set MS_CLIENT_ID=your_live_app_client_id
-# set MS_AUTH_CODE=code_from_browser_redirect   (or MS_REFRESH_TOKEN=...)
+# (The Client ID is baked in safely for public desktop client usage)
 if __name__ == "__main__":
     import os
 
     async def main() -> None:
-        client_id = os.environ["MS_CLIENT_ID"]
+        client_id = "ab5dd215-1a94-4383-a5f2-d51d42ab758f"
+        
         auth_code = os.getenv("MS_AUTH_CODE")
         refresh_token = os.getenv("MS_REFRESH_TOKEN")
 
