@@ -1,6 +1,5 @@
 # Ignore everything
 *
-
 # Allow directories to be traversed
 !*/
 
@@ -11,7 +10,7 @@ __pycache__/
 .vscode/
 venv/
 env/
-
+tests/
 # Allow explicitly tracked files
 !*.py
 !.gitignore

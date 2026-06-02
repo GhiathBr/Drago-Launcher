@@ -1,5 +1,6 @@
 import os
 import json
+import platform
 import shutil
 from pathlib import Path
 
@@ -13,6 +14,18 @@ PORTABLE_DIRS = [
     "CustomSkinLoader",
     "cache",
 ]
+
+
+def get_default_minecraft_dir() -> str:
+    if platform.system() == "Windows":
+        return os.path.expandvars(r"%APPDATA%\.minecraft")
+    return str(Path.home() / ".minecraft")
+
+
+def get_default_data_dir() -> str:
+    if platform.system() == "Windows":
+        return os.path.expandvars(r"%APPDATA%\.drago_launcher")
+    return str(Path.home() / ".drago_launcher")
 
 
 def is_portable() -> bool:
@@ -31,8 +44,8 @@ def is_portable() -> bool:
 
 def enable_portable_mode(launcher_dir: str) -> bool:
     launcher_path = Path(launcher_dir)
-    appdata_minecraft = Path(os.path.expandvars(r"%APPDATA%\.minecraft"))
-    appdata_drago = Path(os.path.expandvars(r"%APPDATA%\.drago_launcher"))
+    appdata_minecraft = Path(get_default_minecraft_dir())
+    appdata_drago = Path(get_default_data_dir())
 
     try:
         for dir_name in PORTABLE_DIRS:
@@ -82,7 +95,7 @@ def get_data_dir(launcher_dir: str) -> str:
         portable_data = Path(launcher_dir) / "data"
         portable_data.mkdir(parents=True, exist_ok=True)
         return str(portable_data)
-    appdata = Path(os.path.expandvars(r"%APPDATA%\.drago_launcher"))
+    appdata = Path(get_default_data_dir())
     appdata.mkdir(parents=True, exist_ok=True)
     return str(appdata)
 
@@ -92,7 +105,7 @@ def get_minecraft_dir(launcher_dir: str) -> str:
         portable_mc = Path(launcher_dir) / ".minecraft"
         portable_mc.mkdir(parents=True, exist_ok=True)
         return str(portable_mc)
-    mine_dir = Path(os.path.expandvars(r"%APPDATA%\.minecraft"))
+    mine_dir = Path(get_default_minecraft_dir())
     mine_dir.mkdir(parents=True, exist_ok=True)
     return str(mine_dir)
 

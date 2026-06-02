@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import minecraft_launcher_lib
+import platform
 import subprocess
 import os
 import sys
@@ -7,6 +8,7 @@ import threading
 import queue
 import asyncio
 import json
+from pathlib import Path
 import requests
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -18,7 +20,19 @@ from backup_manager import BackupManager
 from theme_manager import apply_theme, get_theme_names, THEMES, DEFAULT_THEME
 from console_viewer import spawn_console
 from modpack_manager import import_mrpack
+from network_monitor import NetworkMonitor
+from mineskin_browser import search_skins, get_trending_skins, apply_skin_from_mineskin, get_skin_render_url, get_skin_image_url
+from shader_manager import KNOWN_SHADERS, get_shader_version_info, install_shader, list_installed_shaders
 import portable as portable_mode
+from conflict_scanner import scan_mods_directory, scan_resourcepacks_directory
+from crash_analyzer import analyze_instance as analyze_crash_reports, find_crash_reports
+
+# Try to load tkinterdnd2 for OS drag-and-drop support
+try:
+    from tkinterdnd2 import TkinterDnD
+    _HAVE_DND = True
+except ImportError:
+    _HAVE_DND = False
 
 # SSL verification: disabled by default for antivirus/firewall compatibility,
 # but can be enabled in settings for security
@@ -44,7 +58,7 @@ class DragoLauncher(ctk.CTk):
         self.geometry("900x600")
         self.minsize(800, 500)
         
-        self.CURRENT_VERSION = "v2.0.0"
+        self.CURRENT_VERSION = "v2.1.0"
 
         # --- Portable mode detection ---
         launcher_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, 'frozen', False) else os.getcwd()
@@ -56,7 +70,7 @@ class DragoLauncher(ctk.CTk):
             mine_dir = portable_mode.get_minecraft_dir(launcher_dir)
             self.config_file = os.path.join(launcher_dir, portable_mode.CONFIG_FILENAME)
         else:
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            mine_dir = portable_mode.get_default_minecraft_dir()
             self.config_file = os.path.join(mine_dir, "drago_launcher_config.json")
 
         if not os.path.exists(mine_dir):
@@ -106,6 +120,11 @@ class DragoLauncher(ctk.CTk):
         self.java_installations = scan_java_installations()
         self._java_scan_thread = None
 
+        # Network monitor for silent refresh
+        self.network_monitor = NetworkMonitor()
+        self.network_monitor.add_listener(self._on_internet_restored)
+        self.network_monitor.start()
+
         # Only create default instance if user explicitly chose instance mode
         if not self.config.get("use_global_minecraft"):
             if not self.instance_manager.get_all_instances():
@@ -149,6 +168,9 @@ class DragoLauncher(ctk.CTk):
         # Auto-check for updates silently on startup
         self.after(2000, lambda: self.check_for_updates(silent=True))
 
+    def _get_global_minecraft_dir(self):
+        return portable_mode.get_default_minecraft_dir()
+
     def show_news_page(self):
         self.content_browser_frame.grid_forget()
         self.instances_frame.grid_forget()
@@ -177,23 +199,23 @@ class DragoLauncher(ctk.CTk):
         self.subtitle_label = ctk.CTkLabel(self.sidebar_frame, text="LAUNCHER", font=ctk.CTkFont(size=12))
         self.subtitle_label.grid(row=1, column=0, padx=20, pady=(0, 20))
 
-        # Nav Buttons (Blue)
-        self.btn_home = ctk.CTkButton(self.sidebar_frame, text="Home", fg_color="#1f538d", anchor="w", command=self.show_news_page)
+        # Nav Buttons (Blue theme to match launcher aesthetic)
+        self.btn_home = ctk.CTkButton(self.sidebar_frame, text="Home", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.show_news_page)
         self.btn_home.grid(row=2, column=0, padx=20, pady=10)
         
-        self.btn_instances = ctk.CTkButton(self.sidebar_frame, text="Instances", fg_color="#1f538d", anchor="w", command=self.show_instances_page)
+        self.btn_instances = ctk.CTkButton(self.sidebar_frame, text="Instances", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.show_instances_page)
         self.btn_instances.grid(row=3, column=0, padx=20, pady=10)
 
-        self.btn_mods = ctk.CTkButton(self.sidebar_frame, text="Game Content Browser", fg_color="#1f538d", anchor="w", command=self.show_content_page)
+        self.btn_mods = ctk.CTkButton(self.sidebar_frame, text="Game Content Browser", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.show_content_page)
         self.btn_mods.grid(row=4, column=0, padx=20, pady=10)
 
-        self.btn_update = ctk.CTkButton(self.sidebar_frame, text="Check for Updates", fg_color="#2ecc71", anchor="w", command=self.check_for_updates)
+        self.btn_update = ctk.CTkButton(self.sidebar_frame, text="Check for Updates", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.check_for_updates)
         self.btn_update.grid(row=5, column=0, padx=20, pady=10)
 
-        self.btn_import_modpack = ctk.CTkButton(self.sidebar_frame, text="Import Modpack", fg_color="#9b59b6", anchor="w", command=self.import_modpack_dialog)
+        self.btn_import_modpack = ctk.CTkButton(self.sidebar_frame, text="Import Modpack", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.import_modpack_dialog)
         self.btn_import_modpack.grid(row=6, column=0, padx=20, pady=10)
 
-        self.btn_settings = ctk.CTkButton(self.sidebar_frame, text="Settings", fg_color="#1f538d", anchor="w", command=self.open_settings)
+        self.btn_settings = ctk.CTkButton(self.sidebar_frame, text="Settings", fg_color="#1f538d", hover_color="#2980b9", anchor="w", command=self.open_settings)
         self.btn_settings.grid(row=7, column=0, padx=20, pady=20)
 
     def setup_instances_page(self):
@@ -785,120 +807,428 @@ class DragoLauncher(ctk.CTk):
 
         header_label = ctk.CTkLabel(self.content_browser_frame, text="Game Content Browser", font=ctk.CTkFont(size=20, weight="bold"))
         header_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
-        
-        # Tabs for Content
+
         tabview = ctk.CTkTabview(self.content_browser_frame)
         tabview.grid(row=1, column=0, sticky="nsew")
-        
-        tabview.add("Skins Manager")
-        tabview.add("Modrinth Mods & Worlds")
+
+        tabview.add("Skins")
+        tabview.add("Modrinth Mods")
+        tabview.add("Modrinth Worlds")
+        tabview.add("Shaders")
         tabview.add("Installed Content")
+
+        # ========================================
+                # ========================================
+        # === SKINS TAB (Vertical Layout) ===
+        # ========================================
+        skin_tab = tabview.tab("Skins")
+        skin_tab.grid_columnconfigure(0, weight=0)  # Left panel (fixed)
+        skin_tab.grid_columnconfigure(1, weight=1)  # Right panel (expandable)
+        skin_tab.grid_rowconfigure(0, weight=1)
+
+        # LEFT PANEL - Skin Preview (220px wide)
+        left_panel = ctk.CTkFrame(skin_tab, fg_color="#1e1e1e", width=220)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        left_panel.grid_propagate(False)
         
-        # === SKINS TAB ===
-        skin_tab = tabview.tab("Skins Manager")
-        
-        self.skin_preview_label = ctk.CTkLabel(skin_tab, text="No Skin Loaded", image=None)
-        self.skin_preview_label.pack(pady=20)
-        
-        self.load_visual_skin() # Try to load on boot
+        ctk.CTkLabel(left_panel, text="Current Skin", font=ctk.CTkFont(size=13, weight="bold"), 
+                    text_color="#3498db").pack(pady=(10, 5))
+
+        self.skin_preview_label = ctk.CTkLabel(left_panel, text="Loading...")
+        self.skin_preview_label.pack(pady=10)
 
         def browse_skin():
             from tkinter import filedialog
             import shutil
-            
             filepath = filedialog.askopenfilename(title="Select Skin", filetypes=[("PNG Files", "*.png")])
             if filepath:
                 username = self.username_entry.get().strip() or "DRAGO"
-                mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
-                
+                mine_dir = self._get_global_minecraft_dir()
                 skin_dir = os.path.join(mine_dir, "CustomSkinLoader", "LocalSkin", "skins")
                 os.makedirs(skin_dir, exist_ok=True)
-                
                 target_path = os.path.join(skin_dir, f"{username}.png")
                 try:
                     shutil.copy(filepath, target_path)
-                    
                     csl_config_dir = os.path.join(mine_dir, "CustomSkinLoader")
+                    os.makedirs(csl_config_dir, exist_ok=True)
                     csl_config_path = os.path.join(csl_config_dir, "CustomSkinLoader.json")
-                    
-                    config_data = {
-                        "version": "14.0",
-                        "enable": True,
-                        "loadlist": [
-                            {"name": "LocalSkin", "type": "LocalSkin"},
-                            {"name": "Mojang", "type": "MojangAPI"},
-                            {"name": "Ely.by", "type": "ElyBy"},
-                            {"name": "LittleSkin", "type": "CustomSkinAPI", "root": "https://littleskin.cn/api/yggdrasil"}
-                        ]
-                    }
-                    with open(csl_config_path, "w") as config_file:
-                        json.dump(config_data, config_file, indent=4)
-                        
-                    status_lbl.configure(text=f"Skin applied! Applied to all servers/clients.", text_color="#27ae60")
+                    config_data = {"version": "14.0", "enable": True, "loadlist": [{"name": "LocalSkin", "type": "LocalSkin"}, {"name": "Mojang", "type": "MojangAPI"}]}
+                    with open(csl_config_path, "w") as f:
+                        json.dump(config_data, f, indent=4)
+                    skin_status.configure(text="✓ Applied!", text_color="#27ae60")
                     self.load_visual_skin()
                 except Exception as e:
-                    status_lbl.configure(text=f"Error copying skin: {e}", text_color="#e74c3c")
+                    skin_status.configure(text=f"Error: {e}", text_color="#e74c3c")
 
-        browse_btn = ctk.CTkButton(skin_tab, text="Upload Skin (.png)", fg_color="#8e44ad", hover_color="#9b59b6", command=browse_skin)
-        browse_btn.pack(pady=5)
-        
-        status_lbl = ctk.CTkLabel(skin_tab, text="")
-        status_lbl.pack()
-        
-        # === MODRINTH BROWSER TAB ===
-        mod_tab = tabview.tab("Modrinth Mods & Worlds")
-        mod_tab.grid_columnconfigure(0, weight=1)
-        mod_tab.grid_rowconfigure(2, weight=1)
-        
-        # Version indicator at top
-        self.mod_version_label = ctk.CTkLabel(mod_tab, text="Browsing mods for: Minecraft 1.21.1", 
-                                              font=ctk.CTkFont(size=12, weight="bold"), 
-                                              text_color="#3498db")
-        self.mod_version_label.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 0))
-        
-        # Mod loader warning label
-        self.mod_loader_warning = ctk.CTkLabel(mod_tab, text="", 
-                                               font=ctk.CTkFont(size=11),
-                                               text_color="#e74c3c")
-        self.mod_loader_warning.grid(row=0, column=0, sticky="e", padx=5, pady=(5, 0))
-        
-        self.search_frame = ctk.CTkFrame(mod_tab, fg_color="transparent")
-        self.search_frame.grid(row=1, column=0, sticky="ew", pady=5)
-        self.search_frame.grid_columnconfigure(0, weight=1)
-        
-        self.mod_search_entry = ctk.CTkEntry(self.search_frame, placeholder_text="Search Mods or Modpacks...")
-        self.mod_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        
-        search_btn = ctk.CTkButton(self.search_frame, text="Search", width=80, command=lambda: threading.Thread(target=self.search_modrinth).start())
-        search_btn.grid(row=0, column=1)
-        
-        self.mod_results_frame = ctk.CTkScrollableFrame(mod_tab, fg_color="#1e1e1e")
-        self.mod_results_frame.grid(row=2, column=0, sticky="nsew", pady=5)
-        self.mod_results_frame.grid_columnconfigure(0, weight=1)
-        
-        self.mod_detail_frame = ctk.CTkScrollableFrame(mod_tab, fg_color="#1e1e1e")
-        self.mod_detail_frame.grid_columnconfigure(0, weight=1)
-        
-        # Initial trending fetch
-        threading.Thread(target=self.search_modrinth, args=("",), daemon=True).start()
+        ctk.CTkButton(left_panel, text="📁 Upload Skin", fg_color="#8e44ad", hover_color="#9b59b6", command=browse_skin).pack(pady=5, padx=10, fill="x")
+        ctk.CTkButton(left_panel, text="🔄 Reload", fg_color="#3498db", hover_color="#2980b9", command=self.load_visual_skin).pack(pady=5, padx=10, fill="x")
 
+        skin_status = ctk.CTkLabel(left_panel, text="", wraplength=180)
+        skin_status.pack(pady=10)
+
+        # RIGHT PANEL - Browser
+        right_panel = ctk.CTkFrame(skin_tab, fg_color="transparent")
+        right_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        right_panel.grid_columnconfigure(0, weight=1)
+        right_panel.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(right_panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(header, text="🎨 Browse Skins", font=ctk.CTkFont(size=14, weight="bold"), text_color="#3498db").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header, text="Community skins or upload custom", text_color="#aaaaaa", font=ctk.CTkFont(size=11)).grid(row=1, column=0, sticky="w", pady=(2,10))
+
+        search_row = ctk.CTkFrame(header, fg_color="transparent")
+        search_row.grid(row=2, column=0, sticky="ew")
+        search_row.grid_columnconfigure(0, weight=1)
+
+        search_entry = ctk.CTkEntry(search_row, placeholder_text="Search...")
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        results_scroll = ctk.CTkScrollableFrame(right_panel, fg_color="#1e1e1e")
+        results_scroll.grid(row=1, column=0, sticky="nsew")
+        results_scroll.grid_columnconfigure(0, weight=1)
+
+        self.mineskin_results_container = ctk.CTkFrame(results_scroll, fg_color="transparent")
+        self.mineskin_results_container.pack(fill="both", expand=True, padx=10, pady=10)
+        self.mineskin_results_container.grid_columnconfigure(0, weight=1)
+
+        def do_search(query=None):
+            q = search_entry.get().strip() if query is None else query
+            for w in self.mineskin_results_container.winfo_children():
+                w.destroy()
+            ctk.CTkLabel(self.mineskin_results_container, text="🔍 Searching...", text_color="#3498db").grid(row=0, column=0, pady=20)
+            def _search():
+                try:
+                    skins = search_skins(q) if q else get_trending_skins()
+                    def render():
+                        for w in self.mineskin_results_container.winfo_children():
+                            w.destroy()
+                        if not skins:
+                            ctk.CTkLabel(self.mineskin_results_container, text="⚠️ No skins available\n\nUse upload button instead", text_color="#e74c3c").grid(row=0, column=0, pady=20)
+                            return
+                        for i, s in enumerate(skins[:20]):
+                            sid = s.get("id", 0)
+                            name = s.get("name", f"Skin #{sid}")
+                            card = ctk.CTkFrame(self.mineskin_results_container, fg_color="#2b2b2b", corner_radius=5)
+                            card.grid(row=i, column=0, sticky="ew", pady=3)
+                            card.grid_columnconfigure(0, weight=1)
+                            ctk.CTkLabel(card, text=name, font=ctk.CTkFont(weight="bold"), anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+                            def apply(sid=sid, sname=name):
+                                username = self.username_entry.get().strip() or "DRAGO"
+                                ok, msg = apply_skin_from_mineskin(sid, username, self._get_global_minecraft_dir())
+                                self._update_ui_status(msg, "#27ae60" if ok else "#e74c3c")
+                                if ok:
+                                    skin_status.configure(text=f"✓ {sname}", text_color="#27ae60")
+                                    self.load_visual_skin()
+                            ctk.CTkButton(card, text="Apply", width=90, fg_color="#27ae60", hover_color="#2ecc71", command=apply).grid(row=0, column=1, padx=10, pady=5)
+                    self.after(0, render)
+                except Exception as e:
+                    self.after(0, lambda: ctk.CTkLabel(self.mineskin_results_container, text=f"Error: {e}", text_color="#e74c3c").grid(row=0, column=0, pady=20))
+            threading.Thread(target=_search, daemon=True).start()
+
+        ctk.CTkButton(search_row, text="🔍 Search", width=80, fg_color="#3498db", hover_color="#2980b9", command=do_search).grid(row=0, column=1, padx=(0, 2))
+        ctk.CTkButton(search_row, text="🔥 Trending", width=90, fg_color="#e67e22", hover_color="#d35400", command=lambda: do_search("")).grid(row=0, column=2)
+
+        self.after(500, self.load_visual_skin)
+        self.after(1000, lambda: do_search(""))
+
+        # === MODRINTH MODS TAB ===
+        # ========================================
+        self._setup_modrinth_tab(tabview.tab("Modrinth Mods"), "mod")
+        # ========================================
+        # === MODRINTH WORLDS TAB ===
+        # ========================================
+        self._setup_modrinth_tab(tabview.tab("Modrinth Worlds"), "modpack")
+
+        # ========================================
+        # === SHADER BROWSER TAB ===
+        # ========================================
+        self._setup_modrinth_tab(tabview.tab("Shaders"), "shader")
+
+        # ========================================
         # === INSTALLED CONTENT TAB ===
+        # ========================================
         installed_tab = tabview.tab("Installed Content")
         installed_tab.grid_columnconfigure(0, weight=1)
         installed_tab.grid_rowconfigure(1, weight=1)
-        
+
         self.installed_top_frame = ctk.CTkFrame(installed_tab, fg_color="transparent")
         self.installed_top_frame.grid(row=0, column=0, sticky="ew", pady=5)
         self.installed_top_frame.grid_columnconfigure(0, weight=1)
-        
+
         refresh_btn = ctk.CTkButton(self.installed_top_frame, text="Refresh Installed List", fg_color="#e67e22", hover_color="#d35400", command=self.load_installed_content)
         refresh_btn.grid(row=0, column=1, padx=5)
-        
+
+        scan_btn = ctk.CTkButton(self.installed_top_frame, text="Scan Conflicts", fg_color="#e74c3c", hover_color="#c0392b",
+                                command=lambda: threading.Thread(target=self._scan_mod_conflicts, daemon=True).start())
+        scan_btn.grid(row=0, column=2, padx=5)
+
+        crash_btn = ctk.CTkButton(self.installed_top_frame, text="Crash Reports", fg_color="#9b59b6", hover_color="#8e44ad",
+                                 command=lambda: threading.Thread(target=self._show_crash_reports, daemon=True).start())
+        crash_btn.grid(row=0, column=3, padx=5)
+
         self.installed_scroll = ctk.CTkScrollableFrame(installed_tab, fg_color="#1e1e1e")
         self.installed_scroll.grid(row=1, column=0, sticky="nsew", pady=5)
         self.installed_scroll.grid_columnconfigure(0, weight=1)
-        
+
         self.load_installed_content()
+
+    def _setup_modrinth_tab(self, parent_tab, search_type):
+        parent_tab.grid_columnconfigure(0, weight=1)
+        parent_tab.grid_rowconfigure(2, weight=1)
+
+        prefix = "mods_" if search_type == "mod" else "worlds_" if search_type == "modpack" else "shaders_"
+        label_prefix = "Mods" if search_type == "mod" else "Worlds/Modpacks" if search_type == "modpack" else "Shaders"
+        no_found_msg = f"No {label_prefix} found"
+
+        setattr(self, f"{prefix}version_label",
+                ctk.CTkLabel(parent_tab, text=f"Browsing {label_prefix} for: Minecraft 1.21.1",
+                            font=ctk.CTkFont(size=12, weight="bold"), text_color="#3498db"))
+        getattr(self, f"{prefix}version_label").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 0))
+
+        setattr(self, f"{prefix}loader_warning",
+                ctk.CTkLabel(parent_tab, text="", font=ctk.CTkFont(size=11), text_color="#e74c3c"))
+        getattr(self, f"{prefix}loader_warning").grid(row=0, column=0, sticky="e", padx=5, pady=(5, 0))
+
+        search_frame = ctk.CTkFrame(parent_tab, fg_color="transparent")
+        search_frame.grid(row=1, column=0, sticky="ew", pady=5)
+        search_frame.grid_columnconfigure(0, weight=1)
+
+        search_entry = ctk.CTkEntry(search_frame, placeholder_text=f"Search {label_prefix}...")
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        search_btn = ctk.CTkButton(search_frame, text="Search", width=80)
+        search_btn.grid(row=0, column=1)
+
+        # FIX: Changed from scroll to auto - only show scrollbar when content overflows
+        results_frame = ctk.CTkScrollableFrame(parent_tab, fg_color="#1e1e1e")
+        results_frame.grid(row=2, column=0, sticky="nsew", pady=5)
+        results_frame.grid_columnconfigure(0, weight=1)
+
+        detail_frame = ctk.CTkScrollableFrame(parent_tab, fg_color="#1e1e1e")
+        detail_frame.grid_columnconfigure(0, weight=1)
+
+        def do_search(init_query=None, offset=0):
+            def clear_widgets():
+                for w in results_frame.winfo_children():
+                    w.destroy()
+            self.after(0, clear_widgets)
+
+            import urllib.parse, re
+            query = search_entry.get().strip() if init_query is None else init_query
+            display_version = self.version_var.get()
+            raw_version = self.version_id_to_display.get(display_version, display_version)
+            target_version = "1.20.1"
+            mine_dir = self._get_global_minecraft_dir()
+            vjp = os.path.join(mine_dir, "versions", raw_version, f"{raw_version}.json")
+            if os.path.exists(vjp):
+                try:
+                    vd = json.load(open(vjp))
+                    if 'inheritsFrom' in vd:
+                        target_version = vd['inheritsFrom']
+                    elif 'id' in vd and re.match(r'^\d+\.\d+(?:\.\d+)?$', vd['id']):
+                        target_version = vd['id']
+                except: pass
+            if target_version == "1.20.1":
+                if "-" in raw_version:
+                    for p in reversed(raw_version.split("-")):
+                        if re.match(r'^\d+\.\d+(?:\.\d+)?$', p):
+                            target_version = p; break
+                elif re.match(r'^\d+\.\d+(?:\.\d+)?$', raw_version):
+                    target_version = raw_version
+
+            is_vanilla = search_type == "mod" and not any(l in raw_version.lower() for l in ['fabric','forge','quilt','neoforge'])
+            self.after(0, lambda: getattr(self, f"{prefix}version_label").configure(
+                text=f"Browsing {label_prefix} for: Minecraft {target_version} (Page {offset//15+1})"))
+            if search_type == "mod":
+                if is_vanilla:
+                    self.after(0, lambda: getattr(self, f"{prefix}loader_warning").configure(
+                        text="⚠️ Vanilla - Install Fabric/Forge!", text_color="#e74c3c"))
+                else:
+                    self.after(0, lambda: getattr(self, f"{prefix}loader_warning").configure(text="✓ Mod loader OK", text_color="#27ae60"))
+
+            def show_status(txt):
+                self.after(0, lambda: ctk.CTkLabel(results_frame, text=txt).grid(row=0, column=0, pady=20))
+            show_status(f"Searching...")
+
+            try:
+                if search_type == "mod":
+                    is_vanilla = not any(l in raw_version.lower() for l in ['fabric','forge','quilt','neoforge'])
+                    lower_raw = raw_version.lower()
+                    if "forge" in lower_raw and "neoforge" not in lower_raw:
+                        active_loader = "forge"
+                    elif "neoforge" in lower_raw:
+                        active_loader = "neoforge"
+                    elif "quilt" in lower_raw:
+                        active_loader = "quilt"
+                    else:
+                        active_loader = "fabric"
+                    facets = f'[["versions:{target_version}"],["categories:{active_loader}"]]'
+                    url = f"https://api.modrinth.com/v2/search?limit=15&offset={offset}&facets={urllib.parse.quote(facets)}"
+                elif search_type == "modpack":
+                    # FIX: Worlds tab - Modrinth doesn't have 'world' type, query modpacks with map/adventure categories
+                    facets = f'[["project_type:modpack"],["categories:adventure","categories:maps"]]'
+                    url = f"https://api.modrinth.com/v2/search?limit=15&offset={offset}&facets={urllib.parse.quote(facets)}"
+                elif search_type == "shader":
+                    # Shaders - query shader project type
+                    facets = f'[["project_type:shader"],["versions:{target_version}"]]'
+                    url = f"https://api.modrinth.com/v2/search?limit=15&offset={offset}&facets={urllib.parse.quote(facets)}"
+
+                if query:
+                    url += f"&query={urllib.parse.quote(query)}"
+                else:
+                    url += "&index=downloads"
+                resp = requests.get(url, headers={"User-Agent": "DragoLauncher/2.0"}).json()
+                self.after(0, clear_widgets)
+                hits = resp.get("hits", [])
+                total_hits = resp.get("total_hits", 0)
+                if not hits:
+                    show_status(f"No {label_prefix} found for MC {target_version}.")
+                    return
+                from PIL import Image
+                import io, concurrent.futures
+                def fetch_icon(m):
+                    m['pil_image'] = None
+                    # FIX: Shader images - use icon_url with fallback to featured_gallery
+                    img_url = m.get('icon_url')
+                    if not img_url and m.get('featured_gallery'):
+                        # featured_gallery can be a list or string
+                        gallery = m['featured_gallery']
+                        if isinstance(gallery, list) and len(gallery) > 0:
+                            img_url = gallery[0]
+                        elif isinstance(gallery, str):
+                            img_url = gallery
+                    if img_url:
+                        try:
+                            d = requests.get(img_url, timeout=3).content
+                            m['pil_image'] = Image.open(io.BytesIO(d)).resize((50,50), Image.LANCZOS)
+                        except: pass
+                    return m
+                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                    list(ex.map(fetch_icon, hits))
+                self.after(0, lambda: self._render_modrinth_results(
+                    hits, target_version, offset, total_hits, query,
+                    results_frame, detail_frame, search_frame,
+                    getattr(self, f"{prefix}version_label"), getattr(self, f"{prefix}loader_warning"),
+                    search_type, search_entry, label_prefix, no_found_msg, do_search))
+            except Exception as e:
+                self.after(0, clear_widgets)
+                show_status(f"Error: {e}")
+
+        search_btn.configure(command=lambda: threading.Thread(target=do_search).start())
+        threading.Thread(target=do_search, args=("",), daemon=True).start()
+
+    def _render_modrinth_results(self, hits, target_version, offset, total_hits, query,
+                                  results_frame, detail_frame, search_frame,
+                                  version_label, loader_warning,
+                                  search_type, search_entry, label_prefix, no_found_msg, do_search):
+        # FIX: Add padding at bottom to prevent cards clipping through boundary
+        for i, mod in enumerate(hits):
+            # FIX: Rigid card structure with flex layout to prevent button misalignment
+            card = ctk.CTkFrame(results_frame, fg_color="#2b2b2b", corner_radius=5, height=80)
+            card.grid(row=i, column=0, sticky="ew", pady=5, padx=5)
+            card.grid_columnconfigure(1, weight=1)
+            card.grid_propagate(False)  # Maintain fixed height
+            
+            if mod.get('pil_image'):
+                ctk_img = ctk.CTkImage(light_image=mod['pil_image'], size=(50, 50))
+                img_w = ctk.CTkLabel(card, image=ctk_img, text="")
+            else:
+                img_w = ctk.CTkLabel(card, text="[Icon]", width=50, height=50, fg_color="#1e1e1e", corner_radius=5)
+            img_w.grid(row=0, column=0, rowspan=2, padx=10, pady=10, sticky="n")
+            
+            # Title
+            ctk.CTkLabel(card, text=mod["title"], font=ctk.CTkFont(weight="bold"), anchor="w").grid(row=0, column=1, sticky="w", padx=10, pady=(10,2))
+            
+            # FIX: Description text clamping to 2 lines equivalent (limit to ~80 chars for uniformity)
+            desc_text = mod["description"][:80] + ("..." if len(mod["description"]) > 80 else "")
+            ctk.CTkLabel(card, text=desc_text, text_color="#aaaaaa", anchor="w", wraplength=350).grid(row=1, column=1, sticky="nw", padx=10, pady=(2,10))
+            
+            ctk.CTkButton(card, text="View Info", width=70, fg_color="#8e44ad",
+                         command=lambda m=mod: self._show_mod_detail(
+                             m, target_version, results_frame, detail_frame, search_frame,
+                             version_label, loader_warning, search_type)).grid(row=0, column=2, rowspan=2, padx=5, pady=10)
+            
+            install_text = "Install" if search_type == "mod" else "Install" if search_type == "shader" else "Install"
+            btn = ctk.CTkButton(card, text=install_text, width=70, fg_color="#1f538d", hover_color="#2980b9")
+            btn.configure(command=lambda m_id=mod["project_id"], m_title=mod["title"], b=btn:
+                threading.Thread(target=self.install_modrinth_mod, args=(m_id, target_version, m_title, b)).start())
+            btn.grid(row=0, column=3, rowspan=2, padx=10, pady=10)
+
+        # FIX: Add bottom padding frame to prevent clipping
+        padding_frame = ctk.CTkFrame(results_frame, fg_color="transparent", height=20)
+        padding_frame.grid(row=len(hits), column=0, sticky="ew")
+
+        pag = ctk.CTkFrame(results_frame, fg_color="transparent")
+        pag.grid(row=len(hits)+1, column=0, pady=15)
+        if offset > 0:
+            ctk.CTkButton(pag, text="< Previous", width=100,
+                         command=lambda: threading.Thread(target=do_search, args=(query, max(0, offset-15))).start()).pack(side="left", padx=10)
+        if offset + 15 < total_hits:
+            ctk.CTkButton(pag, text="Next >", width=100,
+                         command=lambda: threading.Thread(target=do_search, args=(query, offset+15)).start()).pack(side="left", padx=10)
+
+    def _show_mod_detail(self, mod, target_version, results_frame, detail_frame,
+                          search_frame, version_label, loader_warning, search_type):
+        version_label.grid_forget()
+        search_frame.grid_forget()
+        results_frame.grid_forget()
+        for w in detail_frame.winfo_children():
+            w.destroy()
+        detail_frame.grid(row=0, column=0, rowspan=3, sticky="nsew", pady=5)
+
+        def go_back():
+            detail_frame.grid_forget()
+            version_label.grid(row=0, column=0, sticky="w", padx=5, pady=(5,0))
+            search_frame.grid(row=1, column=0, sticky="ew", pady=5)
+            results_frame.grid(row=2, column=0, sticky="nsew", pady=5)
+
+        ctk.CTkButton(detail_frame, text="← Back", width=100, fg_color="#555555",
+                     command=go_back).grid(row=0, column=0, sticky="w", padx=10, pady=10)
+
+        hf = ctk.CTkFrame(detail_frame, fg_color="transparent")
+        hf.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        if mod.get('pil_image'):
+            ctk_img = ctk.CTkImage(light_image=mod['pil_image'], size=(80,80))
+            ctk.CTkLabel(hf, image=ctk_img, text="").grid(row=0, column=0, rowspan=2, padx=(0,20))
+        else:
+            ctk.CTkLabel(hf, text="[Icon]", width=80, height=80, fg_color="#1e1e1e", corner_radius=5).grid(row=0, column=0, rowspan=2, padx=(0,20))
+        ctk.CTkLabel(hf, text=mod["title"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(hf, text=f"Author: {mod.get('author', 'Unknown')}", text_color="#aaaaaa").grid(row=1, column=1, sticky="nw")
+        install_btn = ctk.CTkButton(hf, text="Install", fg_color="#27ae60", font=ctk.CTkFont(weight="bold"))
+        install_btn.configure(command=lambda b=install_btn:
+            threading.Thread(target=self.install_modrinth_mod, args=(mod["project_id"], target_version, mod["title"], b)).start())
+        install_btn.grid(row=0, column=2, rowspan=2, padx=20, sticky="e")
+        hf.grid_columnconfigure(1, weight=1)
+
+        df = ctk.CTkFrame(detail_frame, fg_color="#2b2b2b")
+        df.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        detail_frame.grid_rowconfigure(2, weight=1)
+        detail_frame.grid_columnconfigure(0, weight=1)
+
+        tb = ctk.CTkTextbox(df, wrap="word", font=ctk.CTkFont(size=14))
+        tb.pack(padx=20, pady=20, fill="both", expand=True)
+        tb.insert("0.0", mod["description"] + "\n\nFetching details...")
+        tb.configure(state="disabled")
+
+        def fetch():
+            try:
+                resp = requests.get(f"https://api.modrinth.com/v2/project/{mod['project_id']}",
+                                   headers={"User-Agent": "DragoLauncher/2.0"}, timeout=5).json()
+                body = resp.get("body", "")
+                if body:
+                    import re
+                    body = re.sub(r'<[^>]+>', '', body)
+                    body = re.sub(r'!\[.*?\]\([^)]+\)', '', body)
+                    body = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', body)
+                    if len(body) > 12000:
+                        body = body[:12000] + "..."
+                    self.after(0, lambda: (tb.configure(state="normal"), tb.delete("0.0","end"),
+                                          tb.insert("0.0", body), tb.configure(state="disabled")))
+            except: pass
+        threading.Thread(target=fetch, daemon=True).start()
 
     def load_installed_content(self):
         for widget in self.installed_scroll.winfo_children():
@@ -908,7 +1238,7 @@ class DragoLauncher(ctk.CTk):
         use_global = self.config.get("use_global_minecraft", False)
 
         if use_global:
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            mine_dir = self._get_global_minecraft_dir()
             ctk.CTkLabel(self.installed_scroll, text="Content for: Global .minecraft",
                         font=ctk.CTkFont(size=14, weight="bold"), text_color="#3498db").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 15))
 
@@ -940,7 +1270,8 @@ class DragoLauncher(ctk.CTk):
         drop_frame = ctk.CTkFrame(self.installed_scroll, fg_color="#1a1a2e", corner_radius=8, border_width=2, border_color="#3498db")
         drop_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=5)
 
-        drop_label = ctk.CTkLabel(drop_frame, text="📁 Drop .jar mods here or click to browse",
+        dnd_hint = "" if not _HAVE_DND else "\n(Drag & drop files from your file manager)"
+        drop_label = ctk.CTkLabel(drop_frame, text=f"📁 Click to browse .jar mods{dnd_hint}",
                                   font=ctk.CTkFont(size=12), text_color="#888888")
         drop_label.pack(pady=10)
 
@@ -962,9 +1293,41 @@ class DragoLauncher(ctk.CTk):
             self.load_installed_content()
             self._update_ui_status(f"Installed {len(files)} mod(s)", "#27ae60")
 
+        def install_dropped_files(file_paths):
+            if isinstance(file_paths, str):
+                file_paths = file_paths.split()
+            count = 0
+            for fpath in file_paths:
+                fpath = fpath.strip().strip("{}")
+                if not fpath or not os.path.isfile(fpath):
+                    continue
+                if not fpath.lower().endswith(".jar"):
+                    continue
+                try:
+                    dest = mods_dir / os.path.basename(fpath)
+                    os.makedirs(mods_dir, exist_ok=True)
+                    shutil.copy2(fpath, dest)
+                    count += 1
+                except Exception as e:
+                    print(f"Error installing dropped mod: {e}")
+            self.load_installed_content()
+            if count > 0:
+                self._update_ui_status(f"Installed {count} mod(s) from drag-and-drop", "#27ae60")
+
         drop_frame.configure(cursor="hand2")
         drop_frame.bind("<Button-1>", lambda e: browse_and_install_mod())
         drop_label.bind("<Button-1>", lambda e: browse_and_install_mod())
+
+        # Register OS drag-and-drop if tkinterdnd2 is available
+        if _HAVE_DND:
+            try:
+                TkinterDnD.tkdnd_init(self)
+                drop_frame.drop_target_register(TkinterDnD.DND_FILES)
+                drop_frame.dnd_bind("<<Drop>>", lambda e: install_dropped_files(e.data))
+                drop_label.drop_target_register(TkinterDnD.DND_FILES)
+                drop_label.dnd_bind("<<Drop>>", lambda e: install_dropped_files(e.data))
+            except Exception:
+                pass
 
         def create_item(parent, base_dir, filename, idx):
             item_frame = ctk.CTkFrame(parent, fg_color="#2b2b2b", corner_radius=5)
@@ -1005,11 +1368,168 @@ class DragoLauncher(ctk.CTk):
                     create_item(self.installed_scroll, saves_dir, f.name, row_idx)
                     row_idx += 1
 
+    def _get_mods_dir(self):
+        use_global = self.config.get("use_global_minecraft", False)
+        if use_global:
+            return Path(self._get_global_minecraft_dir()) / "mods"
+        current_id = self.config.get("current_instance")
+        if current_id:
+            ipath = self.instance_manager.get_instance_path(current_id)
+            if ipath:
+                return ipath / "mods"
+        return None
+
+    def _scan_mod_conflicts(self):
+        self._update_ui_status("Scanning for mod conflicts...", "#f39c12")
+        mods_dir = self._get_mods_dir()
+        if not mods_dir or not mods_dir.exists():
+            self.after(0, lambda: self._update_ui_status("No mods directory found", "#e74c3c"))
+            return
+        results = scan_mods_directory(str(mods_dir))
+        if results:
+            self.after(0, lambda: self._show_conflict_results(results))
+        else:
+            self.after(0, lambda: self._update_ui_status("No conflicts found ✓", "#27ae60"))
+
+    def _show_conflict_results(self, results):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Mod Conflict Scanner")
+        dialog.geometry("700x500")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(scroll, text="Scan Results", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 15))
+
+        by_severity = {"critical": [], "error": [], "warning": [], "info": []}
+        for r in results:
+            by_severity.setdefault(r.get("severity", "info"), []).append(r)
+
+        severity_colors = {"critical": "#e74c3c", "error": "#e67e22", "warning": "#f1c40f", "info": "#3498db"}
+        severity_labels = {"critical": "Critical", "error": "Error", "warning": "Warning", "info": "Info"}
+
+        has_any = False
+        for sev in ("critical", "error", "warning", "info"):
+            items = by_severity.get(sev, [])
+            if not items:
+                continue
+            has_any = True
+            ctk.CTkLabel(scroll, text=f"{severity_labels[sev]} ({len(items)})",
+                        font=ctk.CTkFont(weight="bold", size=14),
+                        text_color=severity_colors[sev]).pack(anchor="w", pady=(10, 5))
+            for r2 in items:
+                card = ctk.CTkFrame(scroll, fg_color="#2b2b2b", corner_radius=5)
+                card.pack(fill="x", pady=3, padx=5)
+                ctk.CTkLabel(card, text=r2.get("file", "Unknown"), font=ctk.CTkFont(weight="bold"),
+                            anchor="w").pack(fill="x", padx=10, pady=(5, 0), anchor="w")
+                ctk.CTkLabel(card, text=r2["message"], text_color="#aaaaaa", wraplength=600,
+                            anchor="w").pack(fill="x", padx=10, pady=(0, 5), anchor="w")
+
+        if not has_any:
+            ctk.CTkLabel(scroll, text="No issues found!", text_color="#27ae60",
+                        font=ctk.CTkFont(size=14)).pack(pady=20)
+
+        ctk.CTkButton(dialog, text="Close", fg_color="#555555",
+                     command=dialog.destroy).pack(pady=10)
+
+    def _show_crash_reports(self):
+        self._update_ui_status("Checking crash reports...", "#f39c12")
+        use_global = self.config.get("use_global_minecraft", False)
+
+        if use_global:
+            instance_dir = self._get_global_minecraft_dir()
+        else:
+            current_id = self.config.get("current_instance")
+            if not current_id:
+                self.after(0, lambda: self._update_ui_status("No instance selected", "#e74c3c"))
+                return
+            ipath = self.instance_manager.get_instance_path(current_id)
+            if not ipath:
+                self.after(0, lambda: self._update_ui_status("Instance not found", "#e74c3c"))
+                return
+            instance_dir = str(ipath)
+
+        analyses = analyze_crash_reports(instance_dir)
+        if not analyses:
+            self.after(0, lambda: self._show_no_crash_reports())
+        else:
+            self.after(0, lambda: self._show_crash_analysis(analyses))
+
+    def _show_no_crash_reports(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Crash Reports")
+        dialog.geometry("400x200")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="No crash reports found", font=ctk.CTkFont(size=16),
+                    text_color="#27ae60").pack(pady=40)
+        ctk.CTkLabel(dialog, text="Your game hasn't crashed recently ✓",
+                    text_color="#aaaaaa").pack()
+        ctk.CTkButton(dialog, text="Close", fg_color="#555555",
+                     command=dialog.destroy).pack(pady=20)
+
+    def _show_crash_analysis(self, analyses):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Crash Report Analysis")
+        dialog.geometry("750x600")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(scroll, text=f"Crash Reports ({len(analyses)})",
+                    font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(0, 15))
+
+        for report in analyses:
+            report_frame = ctk.CTkFrame(scroll, fg_color="#2b2b2b", corner_radius=8)
+            report_frame.pack(fill="x", pady=10, padx=5)
+
+            header = ctk.CTkFrame(report_frame, fg_color="transparent")
+            header.pack(fill="x", padx=10, pady=(10, 5))
+            ctk.CTkLabel(header, text=report["filename"], font=ctk.CTkFont(weight="bold", size=14),
+                        anchor="w").pack(side="left")
+            if report.get("time"):
+                ctk.CTkLabel(header, text=report["time"], text_color="#aaaaaa",
+                            font=ctk.CTkFont(size=11)).pack(side="right")
+
+            info_text = ""
+            if report.get("minecraft_version"):
+                info_text += f"MC: {report['minecraft_version']}  "
+            if report.get("java_version"):
+                info_text += f"Java: {report['java_version']}  "
+            if report.get("mods_loaded"):
+                info_text += f"Mods: {report['mods_loaded']}"
+            if info_text:
+                ctk.CTkLabel(report_frame, text=info_text, text_color="#aaaaaa",
+                            font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10)
+
+            for match in report["matches"]:
+                match_frame = ctk.CTkFrame(report_frame, fg_color="#1e1e1e", corner_radius=5)
+                match_frame.pack(fill="x", padx=10, pady=5)
+
+                severity_colors = {"critical": "#e74c3c", "error": "#e67e22", "warning": "#f1c40f", "info": "#3498db"}
+                sev_color = severity_colors.get(match.get("severity", "info"), "#aaaaaa")
+
+                ctk.CTkLabel(match_frame, text=f"[{match.get('severity', 'info').upper()}] {match['title']}",
+                            text_color=sev_color, font=ctk.CTkFont(weight="bold", size=12)).pack(anchor="w", padx=10, pady=(5, 0))
+
+                if match.get("suggestion"):
+                    ctk.CTkLabel(match_frame, text=f"💡 {match['suggestion']}",
+                                text_color="#aaaaaa", wraplength=600, justify="left",
+                                font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 5))
+
+        ctk.CTkButton(dialog, text="Close", fg_color="#555555",
+                     command=dialog.destroy).pack(pady=10)
+
     def load_visual_skin(self):
+        """Load and display the current skin preview"""
         try:
             from PIL import Image
             username = self.username_entry.get().strip() or "DRAGO"
-            target_path = os.path.expandvars(rf'%APPDATA%\.minecraft\CustomSkinLoader\LocalSkin\skins\{username}.png')
+            target_path = os.path.join(self._get_global_minecraft_dir(), "CustomSkinLoader", "LocalSkin", "skins", f"{username}.png")
             
             if os.path.exists(target_path):
                 img = Image.open(target_path)
@@ -1021,8 +1541,14 @@ class DragoLauncher(ctk.CTk):
                 ctk_img = ctk.CTkImage(light_image=face, size=(128,128))
                 
                 self.skin_preview_label.configure(image=ctk_img, text="")
-        except Exception:
-            pass
+                # Keep reference to prevent garbage collection
+                self.skin_preview_label.image = ctk_img
+            else:
+                # No skin found - show default message
+                self.skin_preview_label.configure(image=None, text=f"No skin found for '{username}'\n\n👆 Upload a skin or browse below")
+        except Exception as e:
+            print(f"Error loading skin preview: {e}")
+            self.skin_preview_label.configure(image=None, text="Unable to load skin preview")
 
     def search_modrinth(self, init_query=None, offset=0):
         # Clear old results safely via the main thread context
@@ -1045,7 +1571,7 @@ class DragoLauncher(ctk.CTk):
         
         # Extract pure Minecraft version from various formats
         # Try to read from version JSON if it's a modded version
-        mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+        mine_dir = self._get_global_minecraft_dir()
         version_json_path = os.path.join(mine_dir, "versions", raw_version, f"{raw_version}.json")
         
         if os.path.exists(version_json_path):
@@ -1079,14 +1605,25 @@ class DragoLauncher(ctk.CTk):
         print(f"DEBUG: Raw version: {raw_version}, Extracted MC version: {target_version}")
         
         # Check if vanilla version (no mod loader)
-        is_vanilla = not any(loader in raw_version.lower() for loader in ['fabric', 'forge', 'quilt', 'neoforge'])
+        lower_raw = raw_version.lower()
+        is_vanilla = not any(loader in lower_raw for loader in ['fabric', 'forge', 'quilt', 'neoforge'])
+        
+        # Determine active loader
+        if "forge" in lower_raw and "neoforge" not in lower_raw:
+            active_loader = "forge"
+        elif "neoforge" in lower_raw:
+            active_loader = "neoforge"
+        elif "quilt" in lower_raw:
+            active_loader = "quilt"
+        else:
+            active_loader = "fabric"  # Default to fabric, even for vanilla (we can install it)
         
         # Update version label and warning
-        self.after(0, lambda: self.mod_version_label.configure(text=f"Browsing mods for: Minecraft {target_version} (Page {offset//15 + 1})"))
+        self.after(0, lambda: self.mod_version_label.configure(text=f"Browsing {active_loader.capitalize()} mods for: Minecraft {target_version} (Page {offset//15 + 1})"))
         
         if is_vanilla:
             self.after(0, lambda: self.mod_loader_warning.configure(
-                text="⚠️ Vanilla version - Install Fabric/Forge to use mods!",
+                text=f"⚠️ Vanilla version - Install {active_loader.capitalize()} to use mods!",
                 text_color="#e74c3c"
             ))
         else:
@@ -1095,11 +1632,11 @@ class DragoLauncher(ctk.CTk):
         def show_status(txt):
             self.after(0, lambda: ctk.CTkLabel(self.mod_results_frame, text=txt).grid(row=0, column=0, pady=20))
             
-        show_status(f"Fetching Modrinth for Minecraft {target_version}...")
+        show_status(f"Fetching Modrinth for Minecraft {target_version} ({active_loader.capitalize()})...")
         
         try:
-            # Setup specific query to Modrinth - Filter by Fabric and selected Version
-            facets = f'[["versions:{target_version}"],["categories:fabric"]]'
+            # Setup specific query to Modrinth - Filter by dynamic loader and selected Version
+            facets = f'[["versions:{target_version}"],["categories:{active_loader}"]]'
             encoded_facets = urllib.parse.quote(facets)
             url = f"https://api.modrinth.com/v2/search?limit=15&offset={offset}&facets={encoded_facets}"
             if query:
@@ -1115,7 +1652,7 @@ class DragoLauncher(ctk.CTk):
             hits = resp.get("hits", [])
             total_hits = resp.get("total_hits", 0)
             if not hits:
-                show_status(f"No Fabric mods found for Minecraft {target_version}.")
+                show_status(f"No {active_loader.capitalize()} mods found for Minecraft {target_version}.")
                 return
             
             # Prefetch icons in background thread to avoid freezing UI
@@ -1153,7 +1690,7 @@ class DragoLauncher(ctk.CTk):
                 ctk_img = ctk.CTkImage(light_image=mod['pil_image'], size=(50, 50))
                 img_widget = ctk.CTkLabel(card, image=ctk_img, text="")
             else:
-                img_widget = ctk.CTkLabel(card, text="[Icon]", width=50, height=50, fg_color="#1e1e1e", corner_radius=5)
+                img_widget = ctk.CTkLabel(card, text="📦", font=ctk.CTkFont(size=24), width=50, height=50, fg_color="#1e1e1e", corner_radius=5)
             
             img_widget.grid(row=0, column=0, rowspan=2, padx=10, pady=10)
             
@@ -1208,7 +1745,7 @@ class DragoLauncher(ctk.CTk):
             ctk_img = ctk.CTkImage(light_image=mod['pil_image'], size=(80, 80))
             img_widget = ctk.CTkLabel(header_frame, image=ctk_img, text="")
         else:
-            img_widget = ctk.CTkLabel(header_frame, text="[Icon]", width=80, height=80, fg_color="#1e1e1e", corner_radius=5)
+            img_widget = ctk.CTkLabel(header_frame, text="📦", font=ctk.CTkFont(size=36), width=80, height=80, fg_color="#1e1e1e", corner_radius=5)
         img_widget.grid(row=0, column=0, rowspan=2, padx=(0, 20))
         
         ctk.CTkLabel(header_frame, text=mod["title"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=1, sticky="w")
@@ -1314,13 +1851,24 @@ class DragoLauncher(ctk.CTk):
         display_version = self.version_var.get()
         actual_version = self.version_id_to_display.get(display_version, display_version)
         
+        lower_raw = actual_version.lower()
+        # Determine active loader context
+        if "forge" in lower_raw and "neoforge" not in lower_raw:
+            active_loader = "forge"
+        elif "neoforge" in lower_raw:
+            active_loader = "neoforge"
+        elif "quilt" in lower_raw:
+            active_loader = "quilt"
+        else:
+            active_loader = "fabric"  # Default fallback if vanilla
+            
         # Check if it's a vanilla version (no mod loader)
-        is_vanilla = not any(loader in actual_version.lower() for loader in ['fabric', 'forge', 'quilt', 'neoforge'])
+        is_vanilla = not any(loader in lower_raw for loader in ['fabric', 'forge', 'quilt', 'neoforge'])
         
         if is_vanilla:
-            # Offer to auto-install Fabric
+            # Offer to auto-install appropriate loader (currently only Fabric auto-install is supported)
             confirm = ctk.CTkToplevel(self)
-            confirm.title("🔧 Install Fabric?")
+            confirm.title("🔧 Install Mod Loader?")
             confirm.geometry("520x380")  # Increased for better spacing
             confirm.transient(self)
             confirm.grab_set()
@@ -1340,7 +1888,7 @@ class DragoLauncher(ctk.CTk):
                         font=ctk.CTkFont(weight="bold")).pack(pady=(20, 5))
             
             ctk.CTkLabel(confirm,
-                        text=f"1. Install Fabric for Minecraft {target_version}\n2. Install {project_title}\n3. Add 'Fabric {target_version}' to your version list",
+                        text=f"1. Install {active_loader.capitalize()} for Minecraft {target_version}\n2. Install {project_title}\n3. Add '{active_loader.capitalize()} {target_version}' to your version list",
                         justify="left",
                         text_color="#27ae60").pack(pady=5)
             
@@ -1352,19 +1900,19 @@ class DragoLauncher(ctk.CTk):
             button_frame = ctk.CTkFrame(confirm, fg_color="transparent")
             button_frame.pack(pady=20)
             
-            def install_fabric_and_mod():
+            def install_loader_and_mod():
                 confirm.destroy()
-                threading.Thread(target=self._install_fabric_then_mod, 
-                               args=(target_version, project_id, project_title, btn),
+                threading.Thread(target=self._install_loader_then_mod, 
+                               args=(target_version, project_id, project_title, active_loader, btn),
                                daemon=True).start()
             
             def cancel():
                 confirm.destroy()
                 self._update_ui_status("Mod installation cancelled", "#aaaaaa")
             
-            ctk.CTkButton(button_frame, text="Yes, Install Fabric + Mod", 
+            ctk.CTkButton(button_frame, text=f"Yes, Install {active_loader.capitalize()} + Mod", 
                          fg_color="#27ae60", hover_color="#2ecc71",
-                         command=install_fabric_and_mod, width=200).pack(side="left", padx=10)
+                         command=install_loader_and_mod, width=200).pack(side="left", padx=10)
             
             ctk.CTkButton(button_frame, text="Cancel",
                          fg_color="#555555", hover_color="#444444",
@@ -1373,67 +1921,87 @@ class DragoLauncher(ctk.CTk):
             return  # Wait for user decision
         
         # If already has mod loader, proceed normally
-        self._download_and_install_mod(project_id, target_version, project_title, btn)
+        self._download_and_install_mod(project_id, target_version, project_title, btn, active_loader)
     
-    def _install_fabric_then_mod(self, mc_version, mod_project_id, mod_title, btn=None):
-        """Install Fabric, then install the mod"""
+    def _install_loader_then_mod(self, mc_version, mod_project_id, mod_title, active_loader="fabric", btn=None):
+        """Install Fabric/Forge/etc., then install the mod"""
         try:
-            self._update_ui_status(f"Installing Fabric for MC {mc_version}...", "#3498db")
-            
-            # Get Fabric version info
+            self._update_ui_status(f"Installing {active_loader.capitalize()} for MC {mc_version}...", "#3498db")
             import requests
-            fabric_meta_url = f"https://meta.fabricmc.net/v2/versions/loader/{mc_version}"
-            headers = {"User-Agent": "DragoLauncher/2.0"}
+            mine_dir = self._get_global_minecraft_dir()
             
-            fabric_versions = requests.get(fabric_meta_url, headers=headers, timeout=10).json()
-            
-            if not fabric_versions:
-                self._update_ui_status(f"No Fabric available for MC {mc_version}", "#e74c3c")
+            if active_loader == "fabric":
+                # Get Fabric version info
+                fabric_meta_url = f"https://meta.fabricmc.net/v2/versions/loader/{mc_version}"
+                headers = {"User-Agent": "DragoLauncher/2.0"}
+                
+                fabric_versions = requests.get(fabric_meta_url, headers=headers, timeout=10).json()
+                
+                if not fabric_versions:
+                    self._update_ui_status(f"No Fabric available for MC {mc_version}", "#e74c3c")
+                    return
+                
+                # Get latest stable Fabric loader
+                latest_loader = fabric_versions[0]['loader']['version']
+                
+                self._update_ui_status(f"Downloading Fabric {latest_loader}...", "#3498db")
+                
+                # Install Fabric
+                import minecraft_launcher_lib
+                minecraft_launcher_lib.fabric.install_fabric(mc_version, mine_dir)
+            elif active_loader == "forge":
+                import minecraft_launcher_lib
+                self._update_ui_status(f"Finding Forge for MC {mc_version}...", "#3498db")
+                forge_version = minecraft_launcher_lib.forge.find_forge_version(mc_version)
+                if not forge_version:
+                    self._update_ui_status(f"No Forge available for MC {mc_version}", "#e74c3c")
+                    return
+                self._update_ui_status(f"Downloading Forge {forge_version}...", "#3498db")
+                minecraft_launcher_lib.forge.install_forge_version(forge_version, mine_dir)
+            elif active_loader == "neoforge":
+                self._update_ui_status("NeoForge auto-install is not supported yet.", "#e74c3c")
                 return
-            
-            # Get latest stable Fabric loader
-            latest_loader = fabric_versions[0]['loader']['version']
-            
-            # Install Fabric using minecraft-launcher-lib
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
-            
-            self._update_ui_status(f"Downloading Fabric {latest_loader}...", "#3498db")
-            
-            # Install Fabric
-            minecraft_launcher_lib.fabric.install_fabric(mc_version, mine_dir)
-            
-            self._update_ui_status(f"✓ Fabric installed! Now installing {mod_title}...", "#27ae60")
+            elif active_loader == "quilt":
+                import minecraft_launcher_lib
+                self._update_ui_status(f"Finding Quilt for MC {mc_version}...", "#3498db")
+                try:
+                    minecraft_launcher_lib.quilt.install_quilt(mc_version, mine_dir)
+                except AttributeError:
+                    self._update_ui_status("Quilt auto-install is not supported.", "#e74c3c")
+                    return
+                    
+            self._update_ui_status(f"✓ {active_loader.capitalize()} installed! Now installing {mod_title}...", "#27ae60")
             
             # Small delay to let user see the success message
             import time
             time.sleep(1)
             
             # Now install the mod
-            self._download_and_install_mod(mod_project_id, mc_version, mod_title, btn)
+            self._download_and_install_mod(mod_project_id, mc_version, mod_title, btn, active_loader)
             
-            # Refresh version dropdown to show new Fabric version
+            # Refresh version dropdown to show new version
             self.after(0, self._refresh_version_dropdown)
             
         except Exception as e:
-            self._update_ui_status(f"Failed to install Fabric: {e}", "#e74c3c")
-            print(f"Fabric installation error: {e}")
+            self._update_ui_status(f"Failed to install {active_loader.capitalize()}: {e}", "#e74c3c")
+            print(f"{active_loader.capitalize()} installation error: {e}")
             import traceback
             traceback.print_exc()
     
-    def _download_and_install_mod(self, project_id, target_version, project_title, btn=None):
+    def _download_and_install_mod(self, project_id, target_version, project_title, btn=None, active_loader="fabric"):
         """Download and install a mod (separated for reuse)"""
         import requests
         import shutil
         from pathlib import Path
         
-        self._update_ui_status(f"Finding {project_title} for MC {target_version}...", "#f1c40f")
+        self._update_ui_status(f"Finding {project_title} for MC {target_version} ({active_loader})...", "#f1c40f")
         
         # Check if using global .minecraft or instance system
         use_global = self.config.get("use_global_minecraft", False)
         
         if use_global:
             # Use global .minecraft directory
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            mine_dir = self._get_global_minecraft_dir()
             mods_dir = Path(mine_dir) / "mods"
             mods_dir.mkdir(exist_ok=True)
         else:
@@ -1453,12 +2021,12 @@ class DragoLauncher(ctk.CTk):
         
         try:
             # Query the specific version required
-            url = f"https://api.modrinth.com/v2/project/{project_id}/version?loaders=[\"fabric\"]&game_versions=[\"{target_version}\"]"
+            url = f"https://api.modrinth.com/v2/project/{project_id}/version?loaders=[\"{active_loader}\"]&game_versions=[\"{target_version}\"]"
             headers = {"User-Agent": "DragoLauncher/1.0"}
             resp = requests.get(url, headers=headers).json()
             
             if not resp:
-                self._update_ui_status(f"No version found for MC {target_version}!", "#e74c3c")
+                self._update_ui_status(f"No version found for MC {target_version} ({active_loader})!", "#e74c3c")
                 return
                 
             # Get latest matching file
@@ -1489,7 +2057,7 @@ class DragoLauncher(ctk.CTk):
     def _refresh_version_dropdown(self):
         """Refresh the version dropdown to show newly installed versions"""
         try:
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            mine_dir = self._get_global_minecraft_dir()
             raw_installed = minecraft_launcher_lib.utils.get_installed_versions(mine_dir)
             self.installed_versions_cache = [v['id'] for v in raw_installed]
             
@@ -1532,6 +2100,12 @@ class DragoLauncher(ctk.CTk):
             
         except Exception as e:
             print(f"Error refreshing versions: {e}")
+
+    def _on_internet_restored(self):
+        """Silently refresh content when internet comes back"""
+        if hasattr(self, 'main_frame') and self.main_frame.winfo_viewable():
+            threading.Thread(target=self.fetch_real_minecraft_news, daemon=True).start()
+        self._update_ui_status("Connection restored", "#27ae60")
 
     def fetch_optifine_versions(self):
         """
@@ -1695,14 +2269,17 @@ class DragoLauncher(ctk.CTk):
         latest_version = release_data.get("tag_name")
         assets = release_data.get("assets", [])
         
-        # Look for executable asset
-        exe_url = None
+        is_windows = platform.system() == "Windows"
+        
+        # Look for platform-appropriate asset
+        asset_ext = ".exe" if is_windows else (".AppImage" if platform.system() == "Linux" else ".dmg")
+        download_url = None
         for asset in assets:
-            if asset["name"].endswith(".exe"):
-                exe_url = asset["browser_download_url"]
+            if asset["name"].endswith(asset_ext):
+                download_url = asset["browser_download_url"]
                 break
                 
-        if not exe_url:
+        if not download_url:
              return
              
         if messagebox.askyesno("Update Available", f"A new version ({latest_version}) is available!\nDo you want to update now?"):
@@ -1710,33 +2287,51 @@ class DragoLauncher(ctk.CTk):
             
             def _download_and_apply():
                 try:
-                    # Download the new executable
-                    new_exe_data = requests.get(exe_url).content
-                    update_exe_path = "DragoLauncher_Update.exe"
+                    new_exe_data = requests.get(download_url).content
+                    update_exe_path = f"DragoLauncher_Update{asset_ext}"
                     
                     with open(update_exe_path, "wb") as f:
                         f.write(new_exe_data)
                         
-                    # Build an updater batch script
-                    bat_path = "updater.bat"
                     current_exe = os.path.basename(sys.executable)
                     
-                    # If running natively as Python instead of compiled pyinstaller, just run the new exe.
                     if not getattr(sys, 'frozen', False):
                          self.after(0, lambda: self._update_ui_status("Can't auto-update python scripts.", "#e74c3c"))
                          return
-                         
-                    with open(bat_path, "w") as f:
-                        f.write(f'''@echo off
+                    
+                    if is_windows:
+                        bat_path = "updater.bat"
+                        with open(bat_path, "w") as f:
+                            f.write(f'''@echo off
 timeout /t 2 /nobreak >nul
 del "{current_exe}"
 rename "DragoLauncher_Update.exe" "{current_exe}"
 start "" "{current_exe}"
 del "%~f0"
 ''')
-                    import subprocess
-                    subprocess.Popen(bat_path, shell=True)
-                    self.after(0, self.destroy)
+                        import subprocess
+                        startupinfo = None
+                        if os.name == 'nt':
+                            startupinfo = subprocess.STARTUPINFO()
+                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        subprocess.Popen(
+                            bat_path, shell=True,
+                            startupinfo=startupinfo,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                        )
+                        self.after(0, self.destroy)
+                    else:
+                        shell_path = "/tmp/drago_updater.sh"
+                        with open(shell_path, "w") as f:
+                            f.write(f'''#!/bin/sh
+sleep 2
+mv "{update_exe_path}" "{current_exe}"
+chmod +x "{current_exe}"
+exec "{current_exe}"
+''')
+                        os.chmod(shell_path, 0o755)
+                        subprocess.Popen(["/bin/sh", shell_path])
+                        self.after(0, self.destroy)
                 except Exception as e:
                     self.after(0, lambda: self._update_ui_status("Update failed!", "#e74c3c"))
             threading.Thread(target=_download_and_apply, daemon=True).start()
@@ -1778,20 +2373,21 @@ del "%~f0"
 
         # Get Max RAM dynamically
         max_ram = 16
-        try:
-            import ctypes
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            stat = MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(stat)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            max_ram = int(round(stat.ullTotalPhys / (1024**3)))
-        except Exception:
-            pass
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(stat)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                max_ram = int(round(stat.ullTotalPhys / (1024**3)))
+            except Exception:
+                pass
 
         max_ram = max(2, max_ram)
 
@@ -1825,14 +2421,33 @@ del "%~f0"
         # --- Security ---
         ctk.CTkLabel(scroll, text="Security:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
         ssl_verify_var = ctk.BooleanVar(value=self.config.get("ssl_verify", False))
-        ctk.CTkCheckBox(scroll, text="Enable SSL Verification (more secure, may break downloads with some antivirus)",
-                        variable=ssl_verify_var).pack(pady=2)
+        
+        # FIX: Text wrapping for long descriptions to prevent cutoff
+        ssl_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        ssl_frame.pack(fill="x", pady=2, padx=20)
+        ssl_frame.grid_columnconfigure(1, weight=1)
+        
+        ssl_cb = ctk.CTkCheckBox(ssl_frame, text="", variable=ssl_verify_var, width=24)
+        ssl_cb.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        
+        ssl_label = ctk.CTkLabel(ssl_frame, text="Enable SSL Verification (more secure, may break downloads with some antivirus)", 
+                                justify="left", text_color="#dddddd", wraplength=380, anchor="w")
+        ssl_label.grid(row=0, column=1, sticky="w")
+        # Bind label click to toggle checkbox
+        ssl_label.bind("<Button-1>", lambda e: ssl_cb.toggle())
 
         # --- Portable Mode ---
         ctk.CTkLabel(scroll, text="Portable Mode:", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
         portable_var = ctk.BooleanVar(value=self.using_portable)
-        ctk.CTkCheckBox(scroll, text="Run in Portable Mode (all data in launcher folder)",
-                        variable=portable_var).pack(pady=2)
+        
+        port_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        port_frame.pack(fill="x", pady=2)
+        port_cb = ctk.CTkCheckBox(port_frame, text="", variable=portable_var, width=24)
+        port_cb.pack(side="left")
+        port_label = ctk.CTkLabel(port_frame, text="Run in Portable Mode\n(all data in launcher folder)", justify="left", text_color="#dddddd")
+        port_label.pack(side="left", padx=5)
+        port_label.bind("<Button-1>", lambda e: port_cb.toggle())
+        
         ctk.CTkLabel(scroll, text="⚠️ Enabling requires restart", text_color="#f1c40f",
                     font=ctk.CTkFont(size=10)).pack()
 
@@ -1950,23 +2565,24 @@ del "%~f0"
             card.grid(row=i+1, column=0, sticky="ew", pady=10)
             card.grid_columnconfigure(0, weight=1)
             
-            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=16, weight="bold"), text_color="#3a7ebf").grid(row=0, column=0, sticky="w", padx=15, pady=(15, 5))
+            # FIX: Increased text brightness for better contrast on dark background
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=16, weight="bold"), text_color="#60d0ff").grid(row=0, column=0, sticky="w", padx=15, pady=(15, 5))
             
             # Clean html tags from text minimally and truncate if too long
             clean_text = text.replace("<p>", "").replace("</p>", "").replace("<b>", "").replace("</b>", "")
             if len(clean_text) > 300:
                 clean_text = clean_text[:297] + "..."
                 
-            ctk.CTkLabel(card, text=clean_text, wraplength=600, justify="left").grid(row=1, column=0, sticky="w", padx=15, pady=(0, 15))
+            ctk.CTkLabel(card, text=clean_text, wraplength=600, justify="left", text_color="#e0e0e0").grid(row=1, column=0, sticky="w", padx=15, pady=(0, 15))
 
     def setup_bottom_bar(self):
-        # Bottom Control Bar
-        self.bottom_bar = ctk.CTkFrame(self, height=100, corner_radius=0, fg_color="#1e1e1e")
-        self.bottom_bar.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        # Bottom Control Bar - properly sized to contain all elements
+        self.bottom_bar = ctk.CTkFrame(self, corner_radius=0, fg_color="#1e1e1e")
+        self.bottom_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
         self.bottom_bar.grid_columnconfigure(4, weight=1) # Spacer
 
-        # Username
-        self.username_entry = ctk.CTkEntry(self.bottom_bar, placeholder_text="Username", width=150)
+        # Username with clear placeholder
+        self.username_entry = ctk.CTkEntry(self.bottom_bar, placeholder_text="Enter Offline Username...", width=200)
         self.username_entry.insert(0, "DRAGO")
         self.username_entry.grid(row=0, column=0, padx=(20, 10), pady=10)
 
@@ -1975,8 +2591,7 @@ del "%~f0"
         self.btn_microsoft_login.grid(row=1, column=0, padx=(20, 10), pady=(0, 10))
 
         # Dynamically fetch versions (Both installed and available online)
-        mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
-        installed_versions = []
+        mine_dir = self._get_global_minecraft_dir()
         
         if os.path.exists(mine_dir):
             try:
@@ -2107,32 +2722,25 @@ del "%~f0"
         self.progress_bar.pack(anchor="w", pady=(5,0))
         self.progress_bar.pack_forget() # Hide it
 
-        # Big Play Button (Green/Yellow)
-        self.play_button = ctk.CTkButton(self.bottom_bar, text="ENTER THE GAME", 
-                                        font=ctk.CTkFont(size=16, weight="bold"),
+        # Big Play Button (Green) - single row, properly contained
+        self.play_button = ctk.CTkButton(self.bottom_bar, text="▶ PLAY", 
+                                        font=ctk.CTkFont(size=14, weight="bold"),
                                         fg_color="#27ae60", hover_color="#2ecc71", 
-                                        height=40, width=200,
+                                        height=35, width=140,
                                         command=self.start_launch_thread)
-        self.play_button.grid(row=0, column=5, padx=20, pady=10, sticky="e")
+        self.play_button.grid(row=0, column=5, padx=15, pady=10)
         
         # Update play button text with instance name
         self.update_play_button_text()
     
     def update_play_button_text(self):
-        """Update play button text with instance info"""
-        use_global = self.config.get("use_global_minecraft", False)
-        if use_global:
-            self.play_button.configure(text="▶ PLAY (Global)")
-        else:
-            current_id = self.config.get("current_instance")
-            if current_id:
-                inst = self.instance_manager.get_instance(current_id)
-                if inst:
-                    self.play_button.configure(text=f"▶ PLAY {inst['name'][:20]}")
-                    return
-            self.play_button.configure(text="▶ PLAY")
+        """Update play button text - simplified to just PLAY"""
+        # FIX: Simple "▶ PLAY" text as requested - high-visibility green for main action
+        self.play_button.configure(text="▶ PLAY")
 
     def set_gpu_preference(self, java_path):
+        if platform.system() != "Windows":
+            return
         try:
             import winreg
             key_path = r"Software\Microsoft\DirectX\UserGpuPreferences"
@@ -2242,17 +2850,29 @@ del "%~f0"
             
         self.dropdown_window = ctk.CTkToplevel(self)
         self.dropdown_window.overrideredirect(True)
+        # FIX: Set high z-index to prevent overlapping with other UI elements
         self.dropdown_window.attributes("-topmost", True)
+        self.dropdown_window.wm_attributes("-toolwindow", True)
         
-        # Get absolute position of the button
+        # Get absolute position of the button - anchor properly relative to parent
         x = self.version_button.winfo_rootx()
-        y = self.version_button.winfo_rooty() - 300 # Show above the bar
+        btn_y = self.version_button.winfo_rooty()
+        btn_height = self.version_button.winfo_height()
         
-        self.dropdown_window.geometry(f"200x300+{x}+{y}")
+        # Determine optimal height (max 300, or adapt to screen)
+        dropdown_height = min(300, len(self.dropdown_values) * 32 + 10)
+        # FIX: Position above button using bottom: 100%; left: 0; equivalent
+        y = btn_y - dropdown_height - 5  # Small gap for visual separation
         
+        self.dropdown_window.geometry(f"{self.version_button.winfo_width()}x{dropdown_height}+{x}+{y}")
+        
+        # FIX: Enhanced border with box-shadow equivalent for depth and visual separation
+        main_border = ctk.CTkFrame(self.dropdown_window, fg_color="#2b2b2b", border_width=2, border_color="#3498db", corner_radius=8)
+        main_border.pack(fill="both", expand=True, padx=3, pady=3)
+
         # Scrollable frame for versions
-        scroll_frame = ctk.CTkScrollableFrame(self.dropdown_window, width=200, height=300, fg_color="#1e1e1e", corner_radius=0)
-        scroll_frame.pack(fill="both", expand=True)
+        scroll_frame = ctk.CTkScrollableFrame(main_border, fg_color="transparent", corner_radius=0)
+        scroll_frame.pack(fill="both", expand=True, padx=2, pady=2)
         
         def select_version(v):
             self.version_var.set(v)
@@ -2298,10 +2918,8 @@ del "%~f0"
         use_global = self.config.get("use_global_minecraft", False)
         
         if use_global:
-            # Use the original global .minecraft directory
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+            mine_dir = self._get_global_minecraft_dir()
         else:
-            # Get current instance
             current_instance_id = self.config.get("current_instance")
             if not current_instance_id:
                 self._update_ui_status("No instance selected!", "#e74c3c")
@@ -2542,16 +3160,17 @@ del "%~f0"
                 console_viewer = spawn_console(self, process, title=f"Minecraft - {launch_name}")
 
             # Process Priority (High = 0x00000080)
-            try:
-                import ctypes
-                PROCESS_ALL_ACCESS = 0x1F0FFF
-                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, process.pid)
-                if handle:
-                    ctypes.windll.kernel32.SetPriorityClass(handle, 0x00000080)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    print(f"Successfully applied Priority High to PID {process.pid}")
-            except Exception as priority_err:
-                print(f"Failed to set CPU properties: {priority_err}")
+            if platform.system() == "Windows":
+                try:
+                    import ctypes
+                    PROCESS_ALL_ACCESS = 0x1F0FFF
+                    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, process.pid)
+                    if handle:
+                        ctypes.windll.kernel32.SetPriorityClass(handle, 0x00000080)
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                        print(f"Successfully applied Priority High to PID {process.pid}")
+                except Exception as priority_err:
+                    print(f"Failed to set CPU properties: {priority_err}")
 
             # Update play stats if using instance system
             if not use_global:
@@ -2617,8 +3236,7 @@ del "%~f0"
         callback = { "setStatus": set_status, "setProgress": set_progress, "setMax": set_max }
         
         try:
-            mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
-            # This built-in library automatically checks every file signature and downloads missing ones
+            mine_dir = self._get_global_minecraft_dir()
             minecraft_launcher_lib.install.install_minecraft_version(version, mine_dir, callback=callback)
             self._update_ui_status("Version Verified & Repaired!", "#27ae60")
             
@@ -2635,9 +3253,9 @@ del "%~f0"
         if not version or version == "No versions found":
             return
             
-        mine_dir = os.path.expandvars(r'%APPDATA%\.minecraft')
+        mine_dir = self._get_global_minecraft_dir()
         version_dir = os.path.join(mine_dir, "versions", version)
-        
+
         if os.path.exists(version_dir):
             try:
                 import shutil

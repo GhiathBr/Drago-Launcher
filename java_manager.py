@@ -1,9 +1,9 @@
 import os
-import re
-import subprocess
-import shutil
-import json
 import platform
+import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from packaging.version import Version, InvalidVersion
 
@@ -70,9 +70,14 @@ def _java_exe(base: str) -> str:
 
 def _get_java_info(java_path: str) -> dict | None:
     try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         result = subprocess.run(
             [java_path, "-version"],
             capture_output=True, text=True, timeout=10,
+            startupinfo=startupinfo,
         )
         output = result.stderr + result.stdout
         ver_match = re.search(r'version\s+"([^"]+)"', output)
@@ -218,27 +223,36 @@ def suggest_java_for_instance(java_list: list[dict], mc_version: str) -> str | N
     return None
 
 
-JAVA_DOWNLOAD_URLS = {
-    8: {
-        "name": "Java 8 (Temurin)",
-        "url": "https://api.adoptium.net/v3/binary/latest/8/ga/windows/x64/jdk/hotspot/normal/eclipse",
-    },
-    17: {
-        "name": "Java 17 (Temurin)",
-        "url": "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse",
-    },
-    21: {
-        "name": "Java 21 (Temurin)",
-        "url": "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse",
-    },
-}
+def _get_platform_arch():
+    """Return (os, arch) tuple for Adoptium API, e.g. ('windows', 'x64')"""
+    syst = platform.system().lower()
+    if syst == "windows":
+        os_arch = "windows"
+    elif syst == "linux":
+        os_arch = "linux"
+    elif syst == "darwin":
+        os_arch = "mac"
+    else:
+        os_arch = "linux"
+    arch = platform.machine().lower()
+    if arch in ("amd64", "x86_64", "x64"):
+        arch = "x64"
+    elif arch in ("aarch64", "arm64"):
+        arch = "aarch64"
+    else:
+        arch = "x64"
+    return os_arch, arch
 
 
 def get_java_download_url(version: int) -> str | None:
-    info = JAVA_DOWNLOAD_URLS.get(version)
-    return info["url"] if info else None
+    os_arch, arch = _get_platform_arch()
+    url = (
+        f"https://api.adoptium.net/v3/binary/latest/{version}/ga/"
+        f"{os_arch}/{arch}/jdk/hotspot/normal/eclipse"
+    )
+    return url
 
 
 def get_java_download_name(version: int) -> str | None:
-    info = JAVA_DOWNLOAD_URLS.get(version)
-    return info["name"] if info else None
+    names = {8: "Java 8 (Temurin)", 17: "Java 17 (Temurin)", 21: "Java 21 (Temurin)"}
+    return names.get(version)

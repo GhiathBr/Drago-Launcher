@@ -4,6 +4,7 @@ Handles creation, management, and isolation of Minecraft instances
 """
 import os
 import json
+import platform
 import shutil
 import uuid
 from pathlib import Path
@@ -13,7 +14,10 @@ class InstanceManager:
     def __init__(self, base_dir=None):
         """Initialize the instance manager"""
         if base_dir is None:
-            base_dir = os.path.expandvars(r'%APPDATA%\.drago_launcher')
+            if platform.system() == "Windows":
+                base_dir = os.path.expandvars(r'%APPDATA%\.drago_launcher')
+            else:
+                base_dir = str(Path.home() / ".drago_launcher")
         
         self.base_dir = Path(base_dir)
         self.instances_dir = self.base_dir / "instances"

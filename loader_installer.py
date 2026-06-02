@@ -1,9 +1,11 @@
 import os
 import json
-import requests
-import subprocess
-import tempfile
+import os
+import platform
+import re
 import shutil
+import subprocess
+import urllib.request
 from pathlib import Path
 
 
@@ -189,10 +191,15 @@ def _install_forge(mc_version: str, loader_version: str, minecraft_dir: str, cb=
         if not java_path:
             java_path = "java"
 
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
         result = subprocess.run(
             [java_path, "-jar", jar_path, "--installServer", minecraft_dir],
             capture_output=True, text=True, timeout=120,
-            cwd=minecraft_dir,
+            cwd=minecraft_dir, startupinfo=startupinfo,
         )
 
         if os.path.exists(jar_path):
@@ -263,10 +270,15 @@ def _install_neoforge(mc_version: str, loader_version: str, minecraft_dir: str, 
         if not java_path:
             java_path = "java"
 
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
         result = subprocess.run(
             [java_path, "-jar", jar_path, "--install-server", minecraft_dir],
             capture_output=True, text=True, timeout=120,
-            cwd=minecraft_dir,
+            cwd=minecraft_dir, startupinfo=startupinfo,
         )
 
         if os.path.exists(jar_path):
@@ -318,9 +330,15 @@ def get_installed_loader(minecraft_dir: str, version_id: str) -> str | None:
     return None
 
 
+def _get_default_minecraft_dir():
+    if platform.system() == "Windows":
+        return os.path.expandvars(r"%APPDATA%\.minecraft")
+    return str(Path.home() / ".minecraft")
+
+
 def get_loader_display_name(version_id: str) -> str:
     version_json_path = None
-    mine_dir = os.path.expandvars(r"%APPDATA%\.minecraft")
+    mine_dir = _get_default_minecraft_dir()
     candidate = Path(mine_dir) / "versions" / version_id / f"{version_id}.json"
     if candidate.exists():
         version_json_path = candidate
