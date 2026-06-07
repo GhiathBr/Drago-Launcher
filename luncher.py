@@ -1153,8 +1153,9 @@ class DragoLauncher(ctk.CTk):
             
             install_text = "Install" if search_type == "mod" else "Install" if search_type == "shader" else "Install"
             btn = ctk.CTkButton(card, text=install_text, width=70, fg_color="#1f538d", hover_color="#2980b9")
-            btn.configure(command=lambda m_id=mod["project_id"], m_title=mod["title"], b=btn:
-                threading.Thread(target=self.install_modrinth_mod, args=(m_id, target_version, m_title, b)).start())
+            install_fn = self.install_modrinth_shader if search_type == "shader" else self.install_modrinth_mod
+            btn.configure(command=lambda m_id=mod["project_id"], m_title=mod["title"], b=btn, fn=install_fn:
+                threading.Thread(target=fn, args=(m_id, target_version, m_title, b)).start())
             btn.grid(row=0, column=3, rowspan=2, padx=10, pady=10)
 
         # FIX: Add bottom padding frame to prevent clipping
@@ -1198,8 +1199,9 @@ class DragoLauncher(ctk.CTk):
         ctk.CTkLabel(hf, text=mod["title"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=1, sticky="w")
         ctk.CTkLabel(hf, text=f"Author: {mod.get('author', 'Unknown')}", text_color="#aaaaaa").grid(row=1, column=1, sticky="nw")
         install_btn = ctk.CTkButton(hf, text="Install", fg_color="#27ae60", font=ctk.CTkFont(weight="bold"))
-        install_btn.configure(command=lambda b=install_btn:
-            threading.Thread(target=self.install_modrinth_mod, args=(mod["project_id"], target_version, mod["title"], b)).start())
+        install_fn = self.install_modrinth_shader if search_type == "shader" else self.install_modrinth_mod
+        install_btn.configure(command=lambda b=install_btn, fn=install_fn:
+            threading.Thread(target=fn, args=(mod["project_id"], target_version, mod["title"], b)).start())
         install_btn.grid(row=0, column=2, rowspan=2, padx=20, sticky="e")
         hf.grid_columnconfigure(1, weight=1)
 
@@ -1838,6 +1840,89 @@ class DragoLauncher(ctk.CTk):
                 pass
                 
         threading.Thread(target=fetch_full_info, daemon=True).start()
+
+    def install_modrinth_shader(self, project_id, target_version, project_title, btn=None):
+        if btn:
+            self.after(0, lambda: btn.configure(text="Installing", state="disabled", fg_color="#f39c12"))
+        self._download_and_install_shader(project_id, target_version, project_title, btn)
+
+    def _download_and_install_shader(self, project_id, target_version, project_title, btn=None):
+        """Download shader pack from Modrinth into shaderpacks/ (iris/optifine, not fabric)."""
+        import requests
+        import shutil
+        from pathlib import Path
+
+        self._update_ui_status(f"Finding {project_title} for MC {target_version}...", "#f1c40f")
+
+        use_global = self.config.get("use_global_minecraft", False)
+        if use_global:
+            shaderpacks_dir = Path(self._get_global_minecraft_dir()) / "shaderpacks"
+        else:
+            current_instance_id = self.config.get("current_instance")
+            if not current_instance_id:
+                self._update_ui_status("No instance selected!", "#e74c3c")
+                return
+            instance_path = self.instance_manager.get_instance_path(current_instance_id)
+            if not instance_path:
+                self._update_ui_status("Instance not found!", "#e74c3c")
+                return
+            shaderpacks_dir = instance_path / "shaderpacks"
+
+        shaderpacks_dir.mkdir(exist_ok=True)
+
+        try:
+            headers = {"User-Agent": "DragoLauncher/2.0"}
+            base_url = f"https://api.modrinth.com/v2/project/{project_id}/version"
+            game_versions = json.dumps([target_version])
+
+            resp = requests.get(
+                base_url,
+                params={"game_versions": game_versions},
+                headers=headers,
+                timeout=15,
+            ).json()
+
+            if not resp:
+                for loader in ("iris", "optifine"):
+                    resp = requests.get(
+                        base_url,
+                        params={"loaders": json.dumps([loader]), "game_versions": game_versions},
+                        headers=headers,
+                        timeout=15,
+                    ).json()
+                    if resp:
+                        break
+
+            if not resp:
+                self._update_ui_status(
+                    f"No shader version found for MC {target_version}! (Iris or OptiFine required in-game)",
+                    "#e74c3c",
+                )
+                if btn:
+                    self.after(0, lambda: btn.configure(text="Install", fg_color="#1f538d", state="normal"))
+                return
+
+            file_data = resp[0]["files"][0]
+            download_url = file_data["url"]
+            filename = file_data["filename"]
+            target_path = shaderpacks_dir / filename
+
+            self._update_ui_status(f"Downloading {project_title}...", "#3498db")
+
+            with requests.get(download_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(target_path, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
+
+            self._update_ui_status(f"✓ Installed {project_title} to shaderpacks!", "#27ae60")
+            if btn:
+                self.after(0, lambda: btn.configure(text="Installed", fg_color="#27ae60"))
+
+        except Exception as e:
+            self._update_ui_status("Failed to install shader", "#e74c3c")
+            if btn:
+                self.after(0, lambda: btn.configure(text="Install\nFailed", fg_color="#e74c3c", state="normal"))
+            print(f"Shader Install Error: {e}")
 
     def install_modrinth_mod(self, project_id, target_version, project_title, btn=None):
         import requests

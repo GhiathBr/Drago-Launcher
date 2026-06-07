@@ -14,3 +14,5 @@ tests/
 # Allow explicitly tracked files
 !*.py
 !.gitignore
+!MEMORY.md
+!ERRORS.md
